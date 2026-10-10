@@ -1,0 +1,247 @@
+# CMP 50HX Windows EFI unlock (efi-unlock-windows)
+
+Windows installer for the same pre-OS compute unlock that lives in
+[`../efi-unlock/`](../efi-unlock/README.md) for Linux. **One EFI binary +
+one installer + one Gen2 BYOVD runtime** — no kernel patches needed
+beyond the vendor driver.
+
+Ported from [PZH1gdmu/CMP40HX-Unlock](https://github.com/PZH1gdmu/CMP40HX-Unlock)
+v3.0.0 (MIT). The Go sources and the BYOVD Gen2 runtime are taken directly
+from that project and renamed 40HX → 50HX; the embedded `50HXUNLK.EFI`
+is built from `../efi-unlock/unlock50x_v1.c` by the CI Linux job and
+copied into the Go embed directory before the Go build — single source
+of truth, no pre-committed binary in the repo. The hash for any
+tagged release is in the GitHub Release notes; the binary carries the
+same MIT notice from `../efi-unlock/LICENSE-40HX-UNLOCK`.
+
+## What it does
+
+1. **EFI unlock** (pre-OS, on every boot): writes the EFI to
+   `\EFI\50HX\50HXUNLK.EFI` (BCD path) and `\EFI\Boot\bootx64.efi`
+   (firmware fallback path), backs up any existing bootx64.efi to
+   `bootx64.efi.50hx.bak`, creates the `50HX Unlock` UEFI boot entry,
+   and — on every login — chains it first in BootOrder.
+2. **Gen2 PCIe** (BYOVD at logon, with a scheduled task for resilience):
+   loads two pre-signed drivers (`WinRing0x64.sys` for PCI config,
+   `ThrottleStop.sys` for arbitrary physical memory), writes the
+   protected PCIe policy registers on the 50HX, sets TLS=5 GT/s on GPU
+   and root port, and retrains. Drivers uninstall when done by
+   default (cleanest for games / anti-cheat); a resident-guardian mode
+   re-checks every minute.
+3. **Uninstall** removes everything (boot entry, EFI binary,
+   backup, registry, drivers, scheduled tasks, ProgramData cache).
+
+The installer runs entirely from the host, requires no internet, takes
+~1 minute for the default install path, and the first-time success
+prints a clean "GSP enabled" / "Unlock EFI deployed" / "PCIe Gen2 trained"
+sequence.
+
+## Prerequisite firmware settings
+
+All required, like the 40HX tool:
+
+| Setting | Value | Why |
+|---|---|---|
+| Above 4G Decoding | Enabled | payload buffers live >4 GB |
+| Secure Boot | Off for the default unsigned EFI; on is supported with a signed EFI | signer must be trusted in firmware `db` |
+| CSM | Disabled (pure UEFI) | so the firmware sees the boot entry |
+| Fast Boot | Disabled | otherwise the UEFI step is skipped |
+| Resizable BAR | Auto/Enabled | complements Above 4G |
+
+## Secure Boot
+
+The default EFI image is unsigned. To keep Secure Boot on, sign a copy with
+your own key and enroll its certificate in the firmware signature database
+(`db`). The firmware checks this direct boot entry; a Windows certificate
+store entry or a Linux MOK enrollment alone does not make it trusted.
+
+On Linux, the repository helper signs a copy and keeps the unsigned build.
+It is included beside the EFI in both release packages. From the repository
+root, first enter `efi-unlock/`; in a release package, run it from the folder
+that contains `50HXUNLK.EFI`:
+
+```bash
+sudo sbctl create-keys                 # once, if you do not already have keys
+sudo sbctl enroll-keys --microsoft     # once; keep Microsoft's boot certificates
+sudo bash ./sign-efi.sh
+```
+
+For a source build, run `./build.sh` before signing. Key enrollment may need
+firmware Setup Mode and a confirmation after reboot; do it from Linux with
+UEFI runtime access, then enable Secure Boot in firmware. See the
+[Linux Secure Boot guide](https://github.com/xrip/cmp50hx-unlock/blob/master/efi-unlock/README.md#secure-boot-signing)
+for details.
+
+The helper writes `50HXUNLK.signed.EFI`. After enrolling the signing key in
+firmware `db`, place that file beside `50HXInstaller.exe` or pass it directly:
+
+```bat
+50HXInstaller.exe -efi C:\path\to\50HXUNLK.signed.EFI
+```
+
+On Windows, copy the unsigned `50HXUNLK.EFI` from the release folder to a new
+file, then sign the copy with the Windows SDK `signtool` and a PFX whose
+certificate is enrolled in firmware `db`:
+
+```powershell
+Copy-Item 50HXUNLK.EFI 50HXUNLK.signed.EFI
+signtool sign /f db.pfx /fd SHA256 /p "PFX password" 50HXUNLK.signed.EFI
+```
+
+The installer can confirm that the selected PE image has a signature, but only
+firmware can confirm that its signer is trusted in `db`. Keep Microsoft's
+certificates when enrolling custom keys so Windows Boot Manager can still
+start. The EFI signature does not sign Windows or Linux kernel drivers.
+
+## Build (on Windows, MSYS2/Ubuntu, or any Go-capable shell)
+
+The Go toolchain cross-compiles trivially; the binary is a static Windows
+PE that needs no runtime. From `tools/winres_gen/` first (one-shot:
+
+```bat
+go run . -o tools/inst50hx/rsrc_windows_amd64.syso
+```
+
+Then build all three tools:
+
+```bat
+cd tools\inst50hx    && go build -a -trimpath -ldflags="-H=windowsgui -s -w" -o 50HXInstaller.exe   . && cd ..\..
+cd tools\uninstall50x && go build -a -trimpath -ldflags="-H=windowsgui -s -w" -o 50HXUninstaller.exe . && cd ..\..
+cd tools\check50x     && go build -a -trimpath -ldflags="-H=windowsgui -s -w" -o 50HXCheck.exe       . && cd ..\..
+```
+
+PowerShell one-shot:
+
+```powershell
+.\build.ps1
+```
+
+## Install
+
+Run `50HXInstaller.exe` as Administrator (or right-click → "Run as
+administrator"). The GUI shows three sections and pre-selects everything
+that is not already in place; just click "Install selected components".
+For a fully silent / scripted install:
+
+```bat
+50HXInstaller.exe -y
+50HXInstaller.exe -silent
+50HXInstaller.exe -gen2          # one-shot Gen2 retrain (called by the logon task)
+50HXInstaller.exe -status        # print current state, exit
+50HXInstaller.exe -uninstall     # clean removal
+50HXInstaller.exe -task          # register the Gen2 logon task only
+```
+
+A reboot after first install is required (the EFI is only effective on
+the next POST); subsequent boots use the `BootOrder` we set and run
+unlock + chainload every time.
+
+## Verification
+
+After the next reboot, run `50HXCheck.exe` as Administrator. The window
+shows the unlock state (Compute line: `✓ Full unlock (SS0=0x88888888)`)
+and the PCIe state (line: `PCIe: Gen2 x4` = trained, `Gen1` = failed). For
+an end-to-end check run `OpenCL.exe` (same as the 40HX tool's reference
+benchmark) and compare to the locked baseline in
+[`../efi-unlock/runs/20260910-ab-stock-vs-efi.md`](../efi-unlock/runs/20260910-ab-stock-vs-efi.md):
+a fully unlocked 50HX should show ~13.5 TFLOP/s FP32, ~48 TIOP/s INT8 DP4A.
+
+## PCIe Gen2 troubleshooting
+
+How the logon task works (v3.1.3): wait for `nvlddmkm` → wait for the XP3G
+privilege gate (`BAR0+0x8E1B0` = `0xFFFFFFFF`, only trusted once `BOOT_0`
+is a real value) → write the Gen2 policy set via BAR0 → fire the one-shot
+LTSSM adoption kick (`0x8872C=6`) → set LNKCTL2 TLS=2 on the GPU and the
+root port → alternate root/GPU retrains. If the link still does not train
+up, Stage 2 pre-programs the policy + TLS while the link is up, then does a
+Root Link Disable, restarts the device via PnP (WMI Disable/Enable with a
+`pnputil /restart-device` fallback) and — once the device is back — polls
+the XP3G gate through the re-init window, the reboot window where the Linux
+service catches it open.
+
+| Log line | Meaning | Action |
+|---|---|---|
+| `XP3G PLM gate not open (0x…)` | driver/GSP keeps the XP3G block closed; `XP3G_OVR0` writes drop (issue #48, AM5: `0xFFFFFF8F`) | let Stage 2 try (`-gen2 -hard`); if it still fails, cold-boot (full power off) and retry |
+| `policy did not verify - LTSSM kick skipped` | at least one field failed read-back (with a closed gate: the XP3G block); kicking now would adopt the locked set and burn the one-shot for this power cycle | nothing to fix client-side; the log tells us which field drops |
+| `BAR0 unreachable (BOOT_0=0xffffffff)` | the link is down / device lost — policy writes are skipped instead of hammering a dead BAR | expected inside Stage 2 while the link is disabled; elsewhere it means the device is lost |
+| `device did not come back after the PnP restart (still lost)` | the Root Link Disable dropped the card and neither WMI nor `pnputil` brought it back | this host cannot recover the link in software; use BIOS PCIe slot = Gen2 instead |
+| `device back but XP3G gate stayed closed` | the card re-initialized but the gate never opened even in the re-init window | on this host the gate does not open on Windows; adoption via the gate is not possible — BIOS slot = Gen2 is the path |
+| `LNKCAP still Gen1 after the adoption kick` | adoption failed — since v3.1.1 this runs Stage 2 (Link Disable + PnP) instead of returning early, with `-hard` or the default `Gen2AutoHard` | send the log if Stage 2 also fails |
+| GPU-Z / check shows Gen1 at idle | normal power-saving downshift | judge by the GPU's LNKCTL2 TLS target (`TLS=Gen2` = configured); under load the link returns to Gen2 |
+
+Manual test path (what issue #48 reporters should run):
+
+```bat
+50HXInstaller.exe -gen2 -hard
+```
+
+Setting the BIOS PCIe slot link speed to Gen2 (not Auto) also helps — on the
+Linux X79 reference host that alone makes the link train Gen2 at cold boot,
+before any tool runs.
+
+## Rollback
+
+Either click "Uninstall" in the GUI, or:
+
+```bat
+50HXUninstaller.exe
+```
+
+That removes: the boot entry, both EFI copies and the backup, the
+registry key, the logon task, the BYOVD driver service + files, and the
+ProgramData cache. Reboot afterwards for the cleanest final state.
+
+If the system becomes unbootable for any reason (extremely rare; the
+installer's BootOrder writes are also written to the firmware fallback
+path): boot any Windows install media, run
+
+```bat
+bcdedit /delete {<guid of 50HX Unlock>}
+del \EFI\50HX /s
+```
+
+or — if even that fails — the firmware's built-in `Boot0000* Windows
+Boot Manager` is untouched and always bootable.
+
+## Repository layout
+
+- `tools/inst50hx/` — `50HXInstaller.exe` source (installer + GUI,
+  embedded `50HXUNLK.EFI` in `embed/`)
+- `tools/uninstall50x/` — `50HXUninstaller.exe`
+- `tools/check50x/` — `50HXCheck.exe` (read-mostly diagnostics)
+- `tools/50hxcore/` — shared Go core (PCI + BAR0 access, registry,
+  services, ESP mount, Defender; mirrors the 40HX `40hxcore`)
+- `tools/winres_gen/` — generates `rsrc_windows_amd64.syso` for the
+  Windows manifest (one-shot)
+- `gen2/` — BYOVD runtime: `drivers/` (the two pre-signed `.sys` files).
+  The legacy `install_autostart.bat` / `run_gen2.bat` / `uninstall.bat`
+  were removed in v1.1.14 — they predate the Go installer (referenced a
+  Python script and an `Administrator` account that no longer exist, #44);
+  the installer/uninstaller GUI and `-task` cover all of it natively
+- `build.ps1` — one-shot build of all four binaries
+
+## Known caveats
+
+- First test should be the BootNext-style "one-shot run": install with
+  the GUI, observe a clean post-reboot, then promote the entry to
+  first in BootOrder (the installer does the latter automatically on
+  successful install).
+- The Windows OpenCL benchmark numbers lag slightly behind the Linux
+  EFI-only result (cell D of the matrix) — same card, ~10% lower FP32,
+  mostly from clock boost + the missing Gen2 in cells C/D. With Gen2
+  enabled here, expect numbers close to the patched-module row.
+- Multi-GPU hosts: v1 unlocks the first `10de:1e09` the installer
+  sees. Multi-card iteration is not ported from the 40HX tool yet.
+- The EFI binary must match the host architecture (x64). 10 GiB and 20 GiB
+  cards are both supported — the EFI detects the SKU from the WPR2 range
+  the VBIOS POST latches and picks the matching FRTS constant
+  (see `../efi-unlock/README.md`).
+
+## Provenance and license
+
+The Go sources and the BYOVD Gen2 runtime are derived from
+[PZH1gdmu/CMP40HX-Unlock](https://github.com/PZH1gdmu/CMP40HX-Unlock)
+(MIT, Copyright (c) 2026). That license is kept in
+`tools/50hxcore/LICENSE-40HX-UNLOCK` for the runtime pieces; the EFI
+binary built from `../efi-unlock/` carries the same MIT notice from
+`../efi-unlock/LICENSE-40HX-UNLOCK`.

@@ -1,0 +1,17 @@
+diff --git a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -4656,1 +4656,13 @@ _kgspPrepareRegistry
++    if ((pGpu->idInfo.PCIDeviceID == 0x1E0910DEU) &&
++        ((pGpu->idInfo.PCISubDeviceID == 0x155410DEU) ||
++         (pGpu->idInfo.PCISubDeviceID == 0x371F1462U)))
++    {
++        /* Force the low dynamic-event policy pair to zero; leave other pairs at their defaults. */
++        osWriteRegistryDword(pGpu, "RmPerfLimitsOverride", 0x01U);
++        /* Set the backend dynamic-P-State flag used by the setup callback. */
++        osWriteRegistryDword(pGpu, "DisableDynamicPstate", 0U);
++        /* Override NBSI/VBIOS policy values that can reject the P-State object. */
++        osWriteRegistryDword(pGpu, "RMDisablePStates", 0U);
++        osWriteRegistryDword(pGpu, "AllowMaxPerf", 1U);
++    }
+     status = osPackageRegistry(pGpu, NULL, &pKernelGsp->regTableSize);

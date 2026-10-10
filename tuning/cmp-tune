@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""Profile-driven tuning for unlocked CMP cards.
+
+Sets power limit, core/memory VF offsets and the locked core-clock range from
+named profiles. Every value is checked against the limits the card itself
+reports, so a profile can never ask for a clock or power level outside the
+card's own range.
+
+nvidia-smi cannot set VF offsets, so this talks to NVML directly through
+ctypes. No headers and no build step: it dlopens libnvidia-ml.so.1, which the
+driver already installs.
+
+Usage:
+  cmp-tune list                 profiles in the config file
+  cmp-tune show [PROFILE]       what a profile would apply, against card limits
+  cmp-tune status               live state and the card's supported ranges
+  cmp-tune apply PROFILE        apply it
+  cmp-tune reset                back to card defaults
+  cmp-tune core-offset N        set the core VF offset directly
+
+  -i, --index N                 act on one GPU (default: all)
+      --no-sync-governor        do not touch the idle governor drop-in
+"""
+import argparse
+import configparser
+import ctypes
+import os
+import subprocess
+import sys
+
+NVML_SUCCESS = 0
+NVML_CLOCK_GRAPHICS = 0
+NVML_CLOCK_MEM = 2
+
+# Only these are tuned. A box can hold a display card or another accelerator
+# and none of this is validated for them, so anything else is left alone.
+# NVML reports pciDeviceId as (device << 16) | vendor.
+SUPPORTED = {
+    0x1E0910DE: "CMP 50HX",
+    0x220D10DE: "CMP 90HX",
+}
+
+CONFIG_PATHS = [
+    "/etc/cmp-tune.conf",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.conf"),
+]
+
+# profile key -> (config getter, human unit)
+KEYS = ("power_w", "core_offset", "mem_offset", "clock_min", "clock_max")
+
+
+class NvmlError(RuntimeError):
+    pass
+
+
+class NvmlPciInfo(ctypes.Structure):
+    _fields_ = [
+        ("busIdLegacy", ctypes.c_char * 16),
+        ("domain", ctypes.c_uint),
+        ("bus", ctypes.c_uint),
+        ("device", ctypes.c_uint),
+        ("pciDeviceId", ctypes.c_uint),
+        ("pciSubSystemId", ctypes.c_uint),
+        ("busId", ctypes.c_char * 32),
+    ]
+
+
+class Nvml:
+    def __init__(self):
+        try:
+            self.lib = ctypes.CDLL("libnvidia-ml.so.1")
+        except OSError as exc:
+            raise NvmlError(
+                "cannot load libnvidia-ml.so.1 (is the NVIDIA driver "
+                "installed?): %s" % exc)
+        self._call("nvmlInit_v2")
+
+    def _fn(self, name):
+        fn = getattr(self.lib, name, None)
+        if fn is None:
+            raise NvmlError("this driver's NVML has no %s" % name)
+        return fn
+
+    def _call(self, name, *args):
+        ret = self._fn(name)(*args)
+        if ret != NVML_SUCCESS:
+            raise NvmlError("%s failed: %s" % (name, self.error_string(ret)))
+
+    def _try(self, name, *args):
+        """Call and return True on success; used for optional controls."""
+        try:
+            ret = self._fn(name)(*args)
+        except NvmlError:
+            return False
+        return ret == NVML_SUCCESS
+
+    def error_string(self, ret):
+        fn = getattr(self.lib, "nvmlErrorString", None)
+        if fn is None:
+            return "error %d" % ret
+        fn.restype = ctypes.c_char_p
+        return fn(ret).decode("utf-8", "replace")
+
+    def shutdown(self):
+        try:
+            self.lib.nvmlShutdown()
+        except Exception:
+            pass
+
+    def device_count(self):
+        n = ctypes.c_uint()
+        self._call("nvmlDeviceGetCount_v2", ctypes.byref(n))
+        return n.value
+
+    def handle(self, index):
+        h = ctypes.c_void_p()
+        self._call("nvmlDeviceGetHandleByIndex_v2",
+                   ctypes.c_uint(index), ctypes.byref(h))
+        return h
+
+    def name(self, h):
+        buf = ctypes.create_string_buffer(96)
+        self._call("nvmlDeviceGetName", h, buf, ctypes.c_uint(96))
+        return buf.value.decode("utf-8", "replace")
+
+    def pci_device_id(self, h):
+        info = NvmlPciInfo()
+        for fn in ("nvmlDeviceGetPciInfo_v3", "nvmlDeviceGetPciInfo_v2",
+                   "nvmlDeviceGetPciInfo"):
+            if self._try(fn, h, ctypes.byref(info)):
+                return info.pciDeviceId
+        raise NvmlError("cannot read PCI info for a device")
+
+    # --- read state ---------------------------------------------------------
+
+    def clock(self, h, kind):
+        v = ctypes.c_uint()
+        self._call("nvmlDeviceGetClockInfo", h, ctypes.c_int(kind),
+                   ctypes.byref(v))
+        return v.value
+
+    def max_clock(self, h, kind):
+        v = ctypes.c_uint()
+        self._call("nvmlDeviceGetMaxClockInfo", h, ctypes.c_int(kind),
+                   ctypes.byref(v))
+        return v.value
+
+    def supported_graphics_clocks(self, h):
+        """Full list of graphics clocks the card advertises, descending."""
+        mem_count = ctypes.c_uint(0)
+        self._fn("nvmlDeviceGetSupportedMemoryClocks")(
+            h, ctypes.byref(mem_count), None)
+        if mem_count.value == 0:
+            return []
+        mem_arr = (ctypes.c_uint * mem_count.value)()
+        self._call("nvmlDeviceGetSupportedMemoryClocks", h,
+                   ctypes.byref(mem_count), mem_arr)
+        clocks = set()
+        for mem in mem_arr:
+            cnt = ctypes.c_uint(0)
+            self._fn("nvmlDeviceGetSupportedGraphicsClocks")(
+                h, ctypes.c_uint(mem), ctypes.byref(cnt), None)
+            if cnt.value == 0:
+                continue
+            arr = (ctypes.c_uint * cnt.value)()
+            if self._try("nvmlDeviceGetSupportedGraphicsClocks",
+                         h, ctypes.c_uint(mem), ctypes.byref(cnt), arr):
+                clocks.update(int(c) for c in arr if c)
+        return sorted(clocks, reverse=True)
+
+    def power_limit(self, h):
+        v = ctypes.c_uint()
+        self._call("nvmlDeviceGetPowerManagementLimit", h, ctypes.byref(v))
+        return v.value
+
+    def power_constraints(self, h):
+        lo, hi = ctypes.c_uint(), ctypes.c_uint()
+        self._call("nvmlDeviceGetPowerManagementLimitConstraints", h,
+                   ctypes.byref(lo), ctypes.byref(hi))
+        return lo.value, hi.value
+
+    def core_offset(self, h):
+        v = ctypes.c_int()
+        if self._try("nvmlDeviceGetGpcClkVfOffset", h, ctypes.byref(v)):
+            return v.value
+        return None
+
+    def core_offset_range(self, h):
+        lo, hi = ctypes.c_int(), ctypes.c_int()
+        if self._try("nvmlDeviceGetGpcClkMinMaxVfOffset", h,
+                     ctypes.byref(lo), ctypes.byref(hi)):
+            return lo.value, hi.value
+        return None
+
+    def mem_offset(self, h):
+        v = ctypes.c_int()
+        if self._try("nvmlDeviceGetMemClkVfOffset", h, ctypes.byref(v)):
+            return v.value
+        return None
+
+    def mem_offset_range(self, h):
+        lo, hi = ctypes.c_int(), ctypes.c_int()
+        if self._try("nvmlDeviceGetMemClkMinMaxVfOffset", h,
+                     ctypes.byref(lo), ctypes.byref(hi)):
+            return lo.value, hi.value
+        return None
+
+    # --- write state --------------------------------------------------------
+
+    def set_power_limit(self, h, milliwatts):
+        self._call("nvmlDeviceSetPowerManagementLimit", h,
+                   ctypes.c_uint(milliwatts))
+
+    def set_locked_clocks(self, h, lo, hi):
+        self._call("nvmlDeviceSetGpuLockedClocks", h,
+                   ctypes.c_uint(lo), ctypes.c_uint(hi))
+
+    def reset_locked_clocks(self, h):
+        self._call("nvmlDeviceResetGpuLockedClocks", h)
+
+    def set_core_offset(self, h, mhz):
+        self._call("nvmlDeviceSetGpcClkVfOffset", h, ctypes.c_int(mhz))
+
+    def set_mem_offset(self, h, mhz):
+        self._call("nvmlDeviceSetMemClkVfOffset", h, ctypes.c_int(mhz))
+
+
+class Limits:
+    """What this specific card says it supports."""
+
+    def __init__(self, nvml, h):
+        clocks = nvml.supported_graphics_clocks(h)
+        if clocks:
+            self.clock_max = clocks[0]
+            self.clock_min = clocks[-1]
+        else:
+            self.clock_max = nvml.max_clock(h, NVML_CLOCK_GRAPHICS)
+            self.clock_min = self.clock_max
+        self.power_min_w, self.power_max_w = (
+            v / 1000.0 for v in nvml.power_constraints(h))
+        self.core_off = nvml.core_offset_range(h)
+        self.mem_off = nvml.mem_offset_range(h)
+
+
+def load_config():
+    for path in CONFIG_PATHS:
+        if os.path.exists(path):
+            parser = configparser.ConfigParser()
+            parser.read(path)
+            return path, parser
+    raise SystemExit("no config found; looked in: %s" % ", ".join(CONFIG_PATHS))
+
+
+def profile_values(parser, name):
+    if not parser.has_section(name):
+        raise SystemExit("no such profile: %s (try: cmp-tune list)" % name)
+    out = {}
+    for key in KEYS:
+        if parser.has_option(name, key):
+            raw = parser.get(name, key).strip()
+            if raw == "":
+                continue
+            try:
+                out[key] = int(raw)
+            except ValueError:
+                raise SystemExit(
+                    "profile %s: %s must be a whole number, got %r"
+                    % (name, key, raw))
+    unknown = [k for k in parser.options(name) if k not in KEYS]
+    if unknown:
+        raise SystemExit("profile %s: unknown key(s): %s (valid: %s)"
+                         % (name, ", ".join(unknown), ", ".join(KEYS)))
+    return out
+
+
+def resolve(values, limits, profile, index):
+    """Fill defaults from the card and reject anything outside its range."""
+    plan = {}
+    fail = []
+
+    if "power_w" in values:
+        w = values["power_w"]
+        if not (limits.power_min_w <= w <= limits.power_max_w):
+            fail.append("power_w %d is outside the card's %.0f..%.0f W"
+                        % (w, limits.power_min_w, limits.power_max_w))
+        else:
+            plan["power_mw"] = int(w * 1000)
+
+    for key, rng, label in (
+            ("core_offset", limits.core_off, "core"),
+            ("mem_offset", limits.mem_off, "memory")):
+        if key not in values:
+            continue
+        v = values[key]
+        if rng is None:
+            fail.append("%s: this driver/card does not expose a %s VF offset"
+                        % (key, label))
+        elif not (rng[0] <= v <= rng[1]):
+            fail.append("%s %+d is outside the card's %+d..%+d MHz"
+                        % (key, v, rng[0], rng[1]))
+        else:
+            plan[key] = v
+
+    wants_lock = "clock_min" in values or "clock_max" in values
+    if wants_lock:
+        # This is the requested behaviour: a bound the profile leaves out is
+        # taken from the card, so the lock always sits inside its own range.
+        lo = values.get("clock_min", limits.clock_min)
+        hi = values.get("clock_max", limits.clock_max)
+        for label, v in (("clock_min", lo), ("clock_max", hi)):
+            if not (limits.clock_min <= v <= limits.clock_max):
+                fail.append("%s %d is outside the card's %d..%d MHz"
+                            % (label, v, limits.clock_min, limits.clock_max))
+        if lo > hi:
+            fail.append("clock_min %d is above clock_max %d" % (lo, hi))
+        if not fail:
+            plan["clock"] = (lo, hi)
+            plan["clock_defaulted"] = (
+                "clock_min" not in values, "clock_max" not in values)
+    else:
+        plan["clock"] = None
+
+    if fail:
+        raise SystemExit(
+            "profile %r cannot be applied to GPU %d:\n  - %s"
+            % (profile, index, "\n  - ".join(fail)))
+    return plan
+
+
+def describe(plan):
+    bits = []
+    if "power_mw" in plan:
+        bits.append("power %d W" % (plan["power_mw"] // 1000))
+    if "core_offset" in plan:
+        bits.append("core offset %+d MHz" % plan["core_offset"])
+    if "mem_offset" in plan:
+        bits.append("memory offset %+d MHz" % plan["mem_offset"])
+    if plan.get("clock"):
+        lo, hi = plan["clock"]
+        dmin, dmax = plan.get("clock_defaulted", (False, False))
+        note = []
+        if dmin:
+            note.append("min from card")
+        if dmax:
+            note.append("max from card")
+        suffix = " (%s)" % ", ".join(note) if note else ""
+        bits.append("clock %d..%d MHz%s" % (lo, hi, suffix))
+    elif "clock" in plan:
+        bits.append("clock lock cleared")
+    return "; ".join(bits) if bits else "nothing to change"
+
+
+# --- idle governor -----------------------------------------------------------
+
+GOV_UNIT = "cmp-idle-governor"
+GOV_DROPIN_DIR = "/etc/systemd/system/%s.service.d" % GOV_UNIT
+GOV_DROPIN = os.path.join(GOV_DROPIN_DIR, "10-cmp-tune.conf")
+
+
+def governor_present():
+    try:
+        out = subprocess.run(["systemctl", "is-enabled", GOV_UNIT],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.stdout.strip() in ("enabled", "enabled-runtime", "static")
+
+
+def sync_governor(clock, core_offset=None, mem_offset=None, power_w=None):
+    """Keep the governor in step with the applied profile.
+
+    The C governor and this tool drive the same NVML settings. The governor
+    receives the applied profile through its systemd environment, so it can
+    restore the load state without calling this Python tool.
+
+    Two reasons. The governor and this tool drive the same NVML locked-clock
+    setting, so without this its release would drop the profile's clock lock
+    and the card would boost past it while the VF offset stays live. And a
+    non-zero core VF offset pins the card in P0, which holds memory at its
+    full clock during the idle clamp, so the governor needs to know which
+    offset to put back when it releases.
+    """
+    if not governor_present():
+        return None
+    try:
+        if (clock or core_offset is not None or mem_offset is not None or
+                power_w is not None):
+            lines = ["# written by cmp-tune; keeps the governor's release\n",
+                     "# in step with the applied tuning profile.\n",
+                     "[Service]\n"]
+            bits = []
+            if clock:
+                value = "%d,%d" % clock
+                lines.append("Environment=CMP_LOAD_CLOCK=%s\n" % value)
+                bits.append("CMP_LOAD_CLOCK=%s" % value)
+            if core_offset is not None:
+                lines.append("Environment=CMP_LOAD_CORE_OFFSET=%d\n"
+                             % core_offset)
+                bits.append("CMP_LOAD_CORE_OFFSET=%d" % core_offset)
+            if mem_offset is not None:
+                lines.append("Environment=CMP_LOAD_MEM_OFFSET=%d\n"
+                             % mem_offset)
+                bits.append("CMP_LOAD_MEM_OFFSET=%d" % mem_offset)
+            if power_w is not None:
+                lines.append("Environment=CMP_LOAD_POWER_W=%d\n" % power_w)
+                bits.append("CMP_LOAD_POWER_W=%d" % power_w)
+            os.makedirs(GOV_DROPIN_DIR, exist_ok=True)
+            with open(GOV_DROPIN, "w") as fh:
+                fh.writelines(lines)
+            action = ", ".join(bits)
+        else:
+            if not os.path.exists(GOV_DROPIN):
+                return None
+            os.remove(GOV_DROPIN)
+            action = "governor overrides cleared"
+        subprocess.run(["systemctl", "daemon-reload"], check=False, timeout=30)
+        # --no-block: this may run from a unit ordered Before= the governor
+        # (applying a profile at boot), and a blocking restart would deadlock
+        # against that ordering. Queueing the job is enough either way.
+        subprocess.run(["systemctl", "try-restart", "--no-block", GOV_UNIT],
+                       check=False, timeout=30)
+        return action
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("  warning: could not sync the idle governor: %s" % exc)
+        return None
+
+
+# --- commands ----------------------------------------------------------------
+
+def scan(nvml):
+    """Split the GPUs into ones we tune and ones we must not touch."""
+    supported, skipped = [], []
+    for idx in range(nvml.device_count()):
+        h = nvml.handle(idx)
+        try:
+            pci = nvml.pci_device_id(h)
+        except NvmlError:
+            pci = 0
+        if pci in SUPPORTED:
+            supported.append((idx, h, SUPPORTED[pci]))
+        else:
+            skipped.append((idx, nvml.name(h), pci))
+    return supported, skipped
+
+
+def targets(nvml, index, quiet=False):
+    supported, skipped = scan(nvml)
+    if skipped and not quiet:
+        for idx, name, pci in skipped:
+            print("skipping GPU %d (%s, pci %04x:%04x): not a supported CMP card"
+                  % (idx, name, pci & 0xFFFF, pci >> 16))
+    if index is not None:
+        for idx, h, model in supported:
+            if idx == index:
+                return [(idx, h, model)]
+        if index < nvml.device_count():
+            raise SystemExit(
+                "GPU %d is not a supported CMP card; supported: %s"
+                % (index, ", ".join(sorted(SUPPORTED.values()))))
+        raise SystemExit("no GPU with index %d" % index)
+    if not supported:
+        raise SystemExit(
+            "no supported CMP card found (looking for: %s)"
+            % ", ".join(sorted(SUPPORTED.values())))
+    return supported
+
+
+def need_root():
+    if os.geteuid() != 0:
+        raise SystemExit("this needs root (sudo)")
+
+
+def cmd_list(args, parser, path):
+    print("config: %s" % path)
+    for name in parser.sections():
+        values = profile_values(parser, name)
+        if values:
+            body = ", ".join("%s=%s" % (k, values[k])
+                             for k in KEYS if k in values)
+        else:
+            body = "(no overrides - resets the card to defaults)"
+        print("  %-12s %s" % (name, body))
+
+
+def cmd_status(args, nvml):
+    for idx, h, model in targets(nvml, args.index):
+        lim = Limits(nvml, h)
+        print("GPU %d: %s [%s]" % (idx, nvml.name(h), model))
+        print("  now      : core %d MHz, memory %d MHz, power limit %.0f W"
+              % (nvml.clock(h, NVML_CLOCK_GRAPHICS),
+                 nvml.clock(h, NVML_CLOCK_MEM),
+                 nvml.power_limit(h) / 1000.0))
+        co, mo = nvml.core_offset(h), nvml.mem_offset(h)
+        print("  offsets  : core %s, memory %s"
+              % ("%+d MHz" % co if co is not None else "n/a",
+                 "%+d MHz" % mo if mo is not None else "n/a"))
+        print("  card says: clocks %d..%d MHz, power %.0f..%.0f W"
+              % (lim.clock_min, lim.clock_max,
+                 lim.power_min_w, lim.power_max_w))
+        if lim.core_off:
+            print("             core offset %+d..%+d MHz" % lim.core_off)
+        if lim.mem_off:
+            print("             memory offset %+d..%+d MHz" % lim.mem_off)
+
+
+def cmd_show(args, nvml, parser):
+    name = args.profile or "stock"
+    values = profile_values(parser, name)
+    for idx, h, model in targets(nvml, args.index):
+        plan = resolve(values, Limits(nvml, h), name, idx)
+        print("GPU %d (%s): %s" % (idx, nvml.name(h), describe(plan)))
+
+
+def cmd_apply(args, nvml, parser):
+    need_root()
+    values = profile_values(parser, args.profile)
+    plans = []
+    for idx, h, model in targets(nvml, args.index):
+        plans.append((idx, h, resolve(values, Limits(nvml, h), args.profile, idx)))
+
+    applied_clock = None
+    applied_core_offset = None
+    applied_mem_offset = None
+    applied_power_w = None
+    for idx, h, plan in plans:
+        print("GPU %d: %s" % (idx, describe(plan)))
+        if "power_mw" in plan:
+            nvml.set_power_limit(h, plan["power_mw"])
+            applied_power_w = plan["power_mw"] // 1000
+        if "core_offset" in plan:
+            nvml.set_core_offset(h, plan["core_offset"])
+            applied_core_offset = plan["core_offset"]
+        if "mem_offset" in plan:
+            nvml.set_mem_offset(h, plan["mem_offset"])
+            applied_mem_offset = plan["mem_offset"]
+        if plan.get("clock"):
+            nvml.set_locked_clocks(h, *plan["clock"])
+            applied_clock = plan["clock"]
+        elif "clock" in plan:
+            nvml.reset_locked_clocks(h)
+
+    if args.sync_governor:
+        action = sync_governor(applied_clock, applied_core_offset,
+                               applied_mem_offset, applied_power_w)
+        if action:
+            print("idle governor: %s" % action)
+    print("applied profile %r" % args.profile)
+
+
+def cmd_reset(args, nvml):
+    need_root()
+    for idx, h, model in targets(nvml, args.index):
+        lim = Limits(nvml, h)
+        nvml.set_power_limit(h, int(lim.power_max_w * 1000))
+        if lim.core_off:
+            nvml.set_core_offset(h, 0)
+        if lim.mem_off:
+            nvml.set_mem_offset(h, 0)
+        nvml.reset_locked_clocks(h)
+        print("GPU %d: power %.0f W, offsets 0, clock lock cleared"
+              % (idx, lim.power_max_w))
+    if args.sync_governor:
+        action = sync_governor(None, None)
+        if action:
+            print("idle governor: %s" % action)
+
+
+def cmd_core_offset(args, nvml):
+    need_root()
+    for idx, h, model in targets(nvml, args.index, quiet=True):
+        rng = nvml.core_offset_range(h)
+        if rng is None:
+            raise SystemExit("GPU %d does not expose a core VF offset" % idx)
+        if not (rng[0] <= args.value <= rng[1]):
+            raise SystemExit("core offset %+d is outside the card's %+d..%+d MHz"
+                             % (args.value, rng[0], rng[1]))
+        nvml.set_core_offset(h, args.value)
+        if not args.quiet:
+            print("GPU %d: core offset %+d MHz" % (idx, args.value))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="cmp-tune", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-i", "--index", type=int, default=None,
+                    help="act on one GPU (default: all)")
+    ap.add_argument("--no-sync-governor", dest="sync_governor",
+                    action="store_false",
+                    help="do not update the idle governor's drop-in")
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("list")
+    sub.add_parser("status")
+    p_show = sub.add_parser("show")
+    p_show.add_argument("profile", nargs="?")
+    p_apply = sub.add_parser("apply")
+    p_apply.add_argument("profile")
+    sub.add_parser("reset")
+    p_off = sub.add_parser("core-offset")
+    p_off.add_argument("value", type=int)
+    p_off.add_argument("-q", "--quiet", action="store_true")
+    args = ap.parse_args()
+
+    path, parser = load_config()
+    if args.command == "list":
+        return cmd_list(args, parser, path)
+
+    try:
+        nvml = Nvml()
+    except NvmlError as exc:
+        raise SystemExit(str(exc))
+    try:
+        if args.command == "status":
+            cmd_status(args, nvml)
+        elif args.command == "show":
+            cmd_show(args, nvml, parser)
+        elif args.command == "apply":
+            cmd_apply(args, nvml, parser)
+        elif args.command == "reset":
+            cmd_reset(args, nvml)
+        elif args.command == "core-offset":
+            cmd_core_offset(args, nvml)
+    except NvmlError as exc:
+        raise SystemExit("NVML: %s" % exc)
+    finally:
+        nvml.shutdown()
+
+
+if __name__ == "__main__":
+    main()
