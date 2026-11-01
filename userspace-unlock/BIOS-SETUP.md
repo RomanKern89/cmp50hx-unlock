@@ -75,6 +75,28 @@ needed. Wiring for a standard bracket: pin 1 = DCD, 2 = RXD, 3 = TXD, 4 = DTR,
 the kernel all appear on the serial line, so the machine gets a real remote
 console.
 
+## 3a. PCIe Gen2 needs the slot set to Gen2 as well
+
+The driver patch and `cmp50hx-gen2.service` only work when the card comes up
+with its link policy in the Gen2-ready state. The tell is in `dmesg`:
+
+```
+CMP50_GEN2: POLICY_PASS phase=post-booter ... PL=00240032   # bit 20 clear -> Gen2 sticks
+CMP50_GEN2: POLICY_PASS phase=post-booter ... PL=00140036   # bit 20 set   -> locked
+```
+
+In `Advanced` → `System Agent (SA) Configuration` → `PCIe Configuration`, set
+the **link speed of the slot that holds the card to `Gen2`** (not `Auto`, not
+`Gen1`). On this board the slots sit behind PLX PEX8747 switches, so if the
+firmware exposes the switch ports separately, set those to Gen2 as well.
+
+Then **switch the PSU off and on** — a warm reboot does not re-derive the
+adoption, which is one-shot per power cycle.
+
+Do not try to force it from the OS with `setpci` on the card: a manual
+`Retrain Link` with the policy still locked drops the card off the bus (a reboot
+brings it back).
+
 ## 4. Make Linux use it
 
 ```sh
