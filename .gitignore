@@ -17,3 +17,13 @@ userspace-unlock/usplat
 userspace-unlock/*.o
 
 decompil/*.i64
+
+# release build outputs (make release)
+cmp50hx-unlock-linux.run
+cmp50hx-unlock-linux.tar.gz
+cmp50hx-unlock-linux.tar.gz.sha256
+cmp50hx-unlock-windows.zip
+.release-stage/
+efi-unlock/50HXUNLK.EFI
+efi-unlock/*.o
+efi-unlock/*.so

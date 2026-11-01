@@ -36,6 +36,13 @@ decode (memory bound) will not.
 
 ## Two ways to run it
 
+> Prebuilt binaries are on the [releases page](https://github.com/RomanKern89/cmp50hx-unlock/releases):
+> the UEFI application (`50HXUNLK.EFI` and a self-extracting installer for it)
+> and the Linux diagnostics/benchmarks (`rm-issue-rate`, `cmp50-fma`,
+> `cmp50-dp4a`, `cmp50-regs`, `usplat`, `cmp50-unlock-us`) with SHA-256 sums.
+> The kernel modules are deliberately not shipped — they must be built against
+> the target's own kernel and driver.
+
 **1. Patched driver (recommended, needs Secure Boot off or an enrolled MOK).**
 The kernel module performs the privileged write inside its own boot, at the point
 where nothing overwrites it. This is what produces the numbers above, and it is
