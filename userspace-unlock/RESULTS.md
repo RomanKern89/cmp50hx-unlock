@@ -58,8 +58,9 @@ So a pre-driver write cannot survive this driver.
 | Keep the card in D0 across the handoff (`power/control=on`, `vfio_pci.disable_idle_d3=Y`) | No change |
 | Skip the FLR (`--no-flr`) | No change; the FLR is not what loses the state |
 | Real GSP `.fwimage` in the radix pages instead of the zero dummy | Booter still succeeds identically; no change |
-| Driver registry override `NVreg_RegistryDwords="RMOverrideSmSpeedSelect=0x88888888;RMOverrideSmSpeedSelect1=0x00000008"` | Key is accepted (`/proc/driver/nvidia/params` shows it) but every RM allocation then fails with `0x1b` — the documented "unverified" branch does not work on 615 |
-| Switch to the project's validated driver generation | **`linux-modules-nvidia-610-7.0.0-42-generic` does not exist** in the Ubuntu archive, so no signed 610 module is available for this kernel |
+| Driver registry override `NVreg_RegistryDwords="RMOverrideSmSpeedSelect=0x88888888;RMOverrideSmSpeedSelect1=0x00000008"`, first on 615-open | Key is accepted (`/proc/driver/nvidia/params` shows it) but every RM allocation then fails with `0x1b`. The open 615 module does not contain the string `RMOverrideSmSpeedSelect` at all — only `subdeviceCtrlCmdKGrGetSmIssueRateModifier*`, i.e. the getter. The mechanism does not exist in that build. |
+| Same registry override on the **proprietary, Canonical-signed 580** (its object files *do* contain `RMOverrideSmSpeedSelect`) | Driver loads (`580.178.04`, Canonical), key is live in `/proc/driver/nvidia/params`, cards enumerate — and the nine modifiers still read `[5,5,1,5,5,5,5,5,5]`. The documented-but-unverified registry branch is inert on this card, exactly as `docs/CMP50HX.md` hedged. |
+| Switch to the project's validated driver generation | **`linux-modules-nvidia-610-7.0.0-42-generic` does not exist** in the Ubuntu archive; for kernel 7.0.0-38 the objects exist but the signatures package is published as `+2` while the module package pins `+1`, so no linked signed module can be produced |
 
 What is left is the project's own mechanism for exactly this situation:
 `patches/cmp50hx/01-cmp50-stockflow.patch` performs the same privileged write
@@ -97,6 +98,22 @@ cd ../verify && ./rm_issue_rate 0 | python3 verify.py /dev/stdin   # expects all
 Watch `RATE=0x00000000` in the unlock log: that is the hardware accepting the
 override. Watch `rm_issue_rate`: that is what the working system actually uses.
 The gap between the two is the driver re-latch described above.
+
+## 5a. Two operational hazards found while getting there
+
+- **A locally signed module in `updates/` is a boot hazard.** It shadows the
+  signed distro module in `kernel/` *and* is copied into the initramfs, so the
+  next boot comes up with no GPU driver at all — `nvidia-smi` gone, though SSH
+  still works. Keep such modules out of the search path until their key is
+  enrolled; `tools/rollback-patched.sh` moves them aside and `--check` reports
+  which module would load.
+- **The `.run` replaces the userland.** After it installs 610.43.03 libraries,
+  putting the 615 kernel module back yields `Driver/library version mismatch`:
+  the cards work, NVML/CUDA do not. `finish-mok.sh` compares the module and NVML
+  versions and refuses to reboot while they disagree.
+- **DKMS must not build these modules.** `nvidia-dkms-580`/`615` sign with the
+  local MOK key, which is not enrolled, and land in `updates/` where they win
+  over the signed distro build.
 
 ## 6. The one remaining path: the driver-side patch with an enrolled MOK
 
