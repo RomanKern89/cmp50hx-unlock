@@ -97,6 +97,30 @@ Do not try to force it from the OS with `setpci` on the card: a manual
 `Retrain Link` with the policy still locked drops the card off the bus (a reboot
 brings it back).
 
+### Result on this board: not attainable
+
+All slots were set to Gen2 and the machine was fully powered off, and it still
+does not come up:
+
+```
+CPU root port 00:02.0   cap gen2, runs gen2     <- the BIOS setting took
+PLX upstream  08:00.0   cap gen3, runs gen2
+PLX downstream 09:10.0  cap gen3, runs gen1
+CMP 50HX      0a:00.0   cap gen1, runs gen1     <- the card only advertises 2.5 GT/s
+PL_LINK_RATE at post-booter = 0x00140036 (bit 20 set, locked)
+```
+
+The card is two PLX hops away from the CPU, and it only advertises Gen2 after
+its own policy is applied, which happens at POST and depends on the link it
+trained on. Behind the switch it trains at Gen1 and the policy comes up locked.
+There is no x16 slot wired directly to the CPU on this board, and the only
+CPU-direct port (`00:01.0`) is x4 — 2 GB/s, worse than the 4 GB/s of Gen1 x16.
+
+Practical consequence: keep Gen1 x16. It only bounds host↔GPU transfers; the
+compute unlock is SM-bound and unaffected (12.9 TFLOP/s with the link at Gen1).
+Leave `cmp50hx-gen2.service` disabled: with the policy locked it can only loop
+for its full timeout, and its retrain attempts have no effect.
+
 ## 4. Make Linux use it
 
 ```sh
