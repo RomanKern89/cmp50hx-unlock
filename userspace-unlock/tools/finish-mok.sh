@@ -39,8 +39,17 @@ key_enrolled() {
     mokutil --test-key "$CERT" 2>/dev/null | grep -q 'is already enrolled'
 }
 
+# Two ways the patched module may be loaded: an enrolled MOK key, or Secure Boot
+# turned off in the firmware. Both are fine; only this check differs.
+sb_state=$(mokutil --sb-state 2>/dev/null || true)
+sb_disabled=0
+case "$sb_state" in
+*disabled*) sb_disabled=1 ;;
+esac
+
 if [ "$MODE" = check ]; then
     echo "kernel:            $K"
+    echo "Secure Boot:       ${sb_state:-unknown}"
     echo "module in use:     $(modinfo -n nvidia 2>/dev/null || echo none)"
     echo "module version:    $(modinfo -F version nvidia 2>/dev/null || echo none)"
     echo "module signer:     $(modinfo -F signer "$UPDATES/nvidia.ko" 2>/dev/null || modinfo -F signer nvidia 2>/dev/null || echo none)"
@@ -51,12 +60,40 @@ if [ "$MODE" = check ]; then
     exit 0
 fi
 
+if [ "$sb_disabled" = "0" ] && ! key_enrolled; then
+    cat >&2 <<EOF
+Neither condition for loading a locally signed module is met:
+  Secure Boot: ${sb_state:-unknown}
+  MOK key enrolled: $(key_enrolled && echo yes || echo no)
+
+Do one of these once, at the machine:
+
+  a) firmware setup -> Boot -> Secure Boot -> OS Type = "Other OS"
+     (turns Secure Boot off; no key enrolment needed), or
+  b) MokManager -> "Enroll key from disk" -> \\cmp50hx-mok.der
+
+Then run this script again. Steps and caveats: $(dirname "$0")/../FINISH-MOK.md
+EOF
+    exit 1
+fi
+
+if [ "$sb_disabled" = "1" ]; then
+    echo "Secure Boot is off: the patched module will load without a key."
+fi
+
 echo "== 1/4 installing the patched driver and the 610.43.03 userland =="
 # The .run is pinned and already cached in $REPO/cache, so this needs no network.
 ( cd "$REPO" && bash ./install.sh --card cmp50hx )
 
-echo "== 2/4 signing the installed modules and queuing the key =="
-( cd "$REPO" && bash ./tools/sign-modules.sh --import )
+echo "== 2/4 signing the installed modules =="
+# With Secure Boot off the signature is not needed to load, but signing keeps the
+# modules loadable if Secure Boot is ever turned back on. --import is only used
+# when the key still has to be enrolled.
+if [ "$sb_disabled" = "1" ]; then
+    ( cd "$REPO" && bash ./tools/sign-modules.sh ) || echo "signing skipped (not required with Secure Boot off)"
+else
+    ( cd "$REPO" && bash ./tools/sign-modules.sh --import )
+fi
 
 echo "== 3/4 rebuilding the initramfs with the signed modules =="
 update-initramfs -u
