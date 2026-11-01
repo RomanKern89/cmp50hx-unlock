@@ -1,4 +1,4 @@
-# Results: userspace unlock on the two 20 GiB CMP 50HX (host .214)
+# Results: userspace unlock on the two 20 GiB CMP 50HX (test host)
 
 ## Final result (Secure Boot off + patched driver)
 
@@ -144,10 +144,10 @@ performs the same privileged write from inside the driver, before GSP-RM starts,
 so nothing re-applies the fuses afterwards.
 
 It needs a locally built module, which Secure Boot accepts only if the signing
-key is enrolled. On this host the key pair already exists —
-`/var/lib/shim-signed/mok/MOK.{priv,der}`, created by the DKMS install, subject
-`lmserver Secure Boot Module Signature key` — but `mokutil --list-enrolled`
-shows only Canonical's key, so modules signed with it are rejected.
+key is enrolled. On the test host the key pair already existed —
+`/var/lib/shim-signed/mok/MOK.{priv,der}`, created by a DKMS install, with a
+host-specific subject — but `mokutil --list-enrolled` showed only Canonical's
+key, so modules signed with it were rejected.
 
 Enrolling it needs physical presence exactly once, for about two minutes:
 

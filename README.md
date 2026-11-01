@@ -1,662 +1,138 @@
-Русская версия: [README.RU.md](README.RU.md) · [20 GB guide](docs/20GB.md) · [20 GB guide (RU)](docs/20GB_RU.md)
+# CMP 50HX unlock — full FP32 and INT8 speed on the NVIDIA CMP 50HX (TU102)
 
-# CMP 50HX 610.43.03 unlock guide
+[Русская версия ниже](#кратко-по-русски) · [Detailed install guide](INSTALL.md) · [Measured results](userspace-unlock/RESULTS.md)
 
-This repo builds and installs patched NVIDIA `610.43.03` open kernel modules
-for the CMP 50HX (TU102). This guide records each patch and its validation
-status.
+The CMP 50HX (`10de:1e09`, TU102) ships with a fuse-driven clamp on two
+instruction paths: **FP32 FFMA** and **INT8 DP4A** run at roughly 1/32 of what
+the silicon can do. This repository restores both, at every boot, on a normal
+Linux system — and, for hosts where a driver-side patch cannot be loaded,
+contains a **userspace** unlock that performs the same privileged register write
+from before the driver binds the card.
 
-## One-click install
+Everything here was verified on real hardware: two CMP 50HX with 20 GiB
+(memory-modified), Ubuntu 26.04, kernel 7.0.0-42, driver 610.43.03.
 
-Grab the latest from [GitHub Releases](../../releases/latest) — one file
-per OS, one command to unlock:
+## What you get
 
-| OS | Download | Install (one command) |
-|---|---|---|
-| **Linux** | `cmp50hx-unlock-linux.run` | `chmod +x cmp50hx-unlock-linux.run && sudo ./cmp50hx-unlock-linux.run` |
-| **Windows** | `cmp50hx-unlock-windows.zip` | unzip, right-click `50HXInstaller.exe` → *Run as administrator* → *Install* |
+| Metric | Clamped (stock) | Unlocked | Gain |
+| --- | ---: | ---: | ---: |
+| FP32 FFMA | 0.40 TFLOP/s | **12.9 TFLOP/s** | **~32×** |
+| INT8 DP4A | 1.63 TIOP/s | **51.6 TIOP/s** | **~32×** |
 
-Both bundles ship the same UEFI compute unlock (proven live, FP32 31.7×
-and DP4A 28.4× over the locked stock driver — see [A/B matrix](efi-unlock/runs/20260910-ab-stock-vs-efi.md)).
-**No kernel patches required** for the compute unlock. PCIe Gen2 is not
-attempted pre-OS (issue #25: the pre-OS retrain hung some Intel X99/X299
-boards and never trained on other hosts); it is applied OS-side — on
-Windows by the installer's BYOVD logon task, on Linux by the patched
-kernel module / `cmp50hx-gen2.service`. On Windows the
-installer also enables `EnableGpuFirmware=1` so the EFI state survives
-into the OS driver. On Linux the one-click `.run` builds and installs the
-patched kernel module automatically; it is the equivalent path but
-required only if you want the patched kernel module too (the UEFI unlock
-itself works with the stock module).
+`12.9 TFLOP/s` is 96% of the 13.55 TFLOP/s this part can do. The state is
+**persistent** — it survives reboots and a full power cycle — and it is confirmed
+by NVIDIA's own RM interface, not just by a benchmark:
 
-**AGESA / AMD Ryzen APU hosts (issue #24):** the EFI detects an AMD CPU
-via CPUID and uses the CF8-only path for the GPU find, skipping the
-AGESA-unsafe RootBridgeIo paths. The compute unlock still
-runs to completion. Gen2 is never attempted pre-OS on any host (issue
-#25); the OS brings it up via the Windows BYOVD logon task
-or the Linux `cmp50hx-gen2.service`.
-
-To build the bundles yourself: `make release` (Linux + Windows
-toolchain needed — see `Makefile`). CI ships them automatically: GitHub
-Actions on every `v*` tag (`.github/workflows/release.yml`), and
-`.gitlab-ci.yml` does the same on GitLab — including the Release with
-downloadable artifacts. The GitLab pipeline needs only ordinary Linux
-docker runners (the Windows Go tools are cross-compiled with
-`GOOS=windows`).
-
-
-
-## UEFI compute unlock (working, no kernel patches needed)
-
-[`efi-unlock/`](efi-unlock/README.md) is a port of the
-[CMP40HX-Unlock](https://github.com/PZH1gdmu/CMP40HX-Unlock) v3.0.0 UEFI
-application (MIT) to the 50HX. It unlocks SS0/SS1 **pre-OS** via the same
-V67 canary Booter exploit as stockflow, then chainloads the Linux boot
-manager with no POST in between — so the compute unlock needs **no patched
-kernel module at all**.
-
-Proven live on 2026-09-10 (host .224): the exploit fires
-(`*** UNLOCKED (SS0=0x88888888 SS1=0x8) ***`), the state survives into
-Linux with zero Xid, and an A/B test against the **stock, unpatched**
-610.43.03 driver measured FP32 0.427 → **13.512 TFLOP/s (31.7x)** and
-DP4A 1.689 → **47.984 TIOP/s (28.4x)** versus the locked baseline — the
-stock driver's GSP boot accepts the pre-OS state cleanly. Full matrix in
-[`efi-unlock/runs/20260910-ab-stock-vs-efi.md`](efi-unlock/runs/20260910-ab-stock-vs-efi.md).
-
-ReBAR, Gen2, and the RT-count override remain kernel patches (see the
-feature table in the directory README). Install guide, prerequisites,
-verification, and rollback: [`efi-unlock/README.md`](efi-unlock/README.md).
-
-The rest of this file is the working record for the CMP50HX patches in
-`patches/cmp50hx/`. It explains the code path, the reason for each change, the
-checks that support it, and the limits of the proof. The series is for the
-official NVIDIA `610.43.03` open-module source and for the tested CMP50HX PCI
-identity:
-
-| Field | Packed RM value | Linux PCI value |
-| --- | ---: | ---: |
-| device | `0x1E0910DE` | vendor `10de`, device `1e09` |
-| NVIDIA board | `0x155410DE` | `10de:1554` |
-| MSI board | `0x371F1462` | `1462:371f` |
-
-The packed values are used by RM/GSP code. The Linux module uses the split
-vendor, device, and subsystem fields. The two forms must not be mixed when a
-new patch is made.
-
-## Kernel API compatibility
-
-Kernel-version compatibility is maintained separately from CMP50HX features.
-`patches/cmp50hx/` contains card-specific changes. The shared compatibility
-patch is `patches/common/01-nvidia-kernel-string-api.patch`; `build.sh` applies
-it after the selected card patch series.
-
-The patch updates string-copy code in these NVIDIA Open `610.43.03` source
-files:
-
-| Source file | Change |
-| --- | --- |
-| `kernel-open/nvidia/os-interface.c` | Use `strscpy` for the current process name. |
-| `kernel-open/nvidia/linux_nvswitch.c` | Use bounded `memcpy` for the fixed-length registry value and `strscpy_pad` in the string wrapper. |
-| `kernel-open/nvidia-uvm/uvm_pmm_gpu.c` | Use `strscpy` for the UVM chunk name. |
-| `kernel-open/nvidia-modeset/nvidia-modeset-linux.c` | Use `strscpy_pad` in the modeset string wrapper. |
-
-The same patch is applied unchanged for each kernel build.
-
-| Kernel | Build result |
-| --- | --- |
-| `6.8.0-139-generic` | All five NVIDIA modules built. |
-| `7.2.9-cmp50hx` | `nvidia`, `nvidia-uvm`, `nvidia-modeset`, and `nvidia-peermem` built. |
-
-These results cover only the listed kernel releases. On `7.2.9-cmp50hx`,
-`nvidia-drm.ko` was omitted because NVIDIA `610.43.03` uses DRM atomic APIs
-that do not match this kernel's API; the shared string compatibility patch
-does not address that separate issue.
-
-## CUDA kernel profiling
-
-The driver build series includes `08-cmp50-driver-profiling.patch`. For the
-supported CMP 50HX PCI and subsystem IDs, it clears `isCmpSku` in the chip-info
-copy used by CPU-RM. This is meant to let unmodified CUDA profilers read kernel
-and SM metrics from workloads such as LLM inference.
-
-This driver path is not yet built or live-tested. It does not change PCI IDs or
-unlock SMs. The existing private CUPTI and Nsight copies remain validated for
-the tool versions listed in the
-[profiling audit](docs/CMP50HX.md#driver-side-cuda-profiling-gate).
-
-## CMP 50HX 20 GB support
-
-Patch `01-cmp50-stockflow.patch` supports both the original 10 GB layout and
-the 20 GB layout. The old patch used fixed 10 GB WPR2 addresses and could fail
-with NVIDIA Booter error `0x8d` on a 20 GB card. The updated patch reads the
-stock FWSEC WPR2 range for each GPU, accepts only the known `0xe00` span, and
-keeps the low/high values in per-BDF state for later boot checks.
-
-The 20 GB path was validated with four `10de:1e09` / `10de:1554` cards, each
-reporting `20480 MiB`, on NVIDIA Open `610.43.03`. See the [20 GB guide](docs/20GB.md)
-for the install order, checks, and host limits. The Russian guide is
-[available here](docs/20GB_RU.md).
-
-10 GB and 20 GB CMP 50HX cards may be installed together. WPR2 state is keyed
-by each card's PCI bus/device address, so one card's memory geometry is never
-used for another card. This mixed-size arrangement is supported by the design;
-verify every card after the first cold boot.
-
-The split is mechanical, not a new code path: patch 01 is 5 files/24 hunks,
-patch 02 is 1 file/1 hunk, patch 03 is 1 file/4 hunks, and patch 04 is 1
-file/3 hunks. The old monolithic patch and this ordered series produce the
-same eight changed source files.
-
-Patch 05 (`05-cmp50-auto-pstate.patch`) is **deliberately not built**. A
-cold-boot A/B on 2026-08-26 proved it does not enable native idle/load
-selection: it pins the card at P8 645/405 even at 100% load (about 22x less
-memory bandwidth, 2.9x less compute) and breaks the idle governor, because
-with it the P16 release no longer restores clocks. The file is kept on disk
-for research only. Native automatic P-State selection was investigated to
-completion and is not host-reachable — the enable sits behind a readiness
-barrier inside signed GSP-RM — so the optional idle governor below is the
-idle-power solution.
-
-## Linux P2P support
-
-The Linux kernel-module build includes P2P support for CMP 50HX cards and a
-BAR1 patch for RTX 2080 Ti peers. On Ubuntu 24.04.4 with kernel
-6.8.0-139-generic and two 20 GiB CMP 50HX cards, `nvidia-smi topo -p2p r`
-and `nvidia-smi topo -p2p w` both report `OK` between the cards. Each card
-used a 32 GiB BAR1 (`cmp50_rebar_size=9`).
-
-This confirms the driver's P2P capability report; no CUDA peer-transfer
-benchmark was run. See [`docs/P2P.md`](docs/P2P.md) for setup and limits.
-
-## Quick install (Ubuntu/Debian)
-
-On a fresh Ubuntu or Debian system with a CMP 50HX (`10de:1e09`) installed:
-
-```bash
-curl -fsSL https://xrip.github.io/cmp50hx-unlock/install.sh | sudo bash
+```
+NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER
+stock:    v1 [5,5,1,5,5,5,5,5,5]   v2 [5,5,5,5,5,5,5,5]
+unlocked: v1 [0,0,0,0,0,0,0,0,0]   v2 [0,0,0,0,0,0,0,0]      (0 = full speed)
 ```
 
-The installer adds the build tools, installs the NVIDIA `610.43.03` userland
-from the official `.run` package, builds the patched modules for the running
-kernel, installs them with a backup, blacklists `nouveau`, rebuilds and verifies
-the initramfs, and runs `depmod`. It never reboots or unloads a loaded driver.
-It ends with a best-effort live check of the card.
+FP16 half2, INT32, memory bandwidth and PCIe were never clamped, so they do not
+change. Workloads limited by the SM's FP32/INT8 rate get the full 32×; LLM token
+decode (memory bound) will not.
 
-The patched driver now applies the PCIe unlock policy itself at first
-device open and kicks the one-shot capability adoption (GSP reverts the
-policy registers right after the driver's boot window, which is why the
-old value-checking gate never fired; re-applying after that one-shot
-revert is stable). The `cmp50hx-gen2` boot service remains as the safety
-net: the driver's own Retrain Link can fail while GSP link management is
-still settling in the first seconds after boot, so the service watches for
-the card's target speed and retrains until the link is at Gen2 x4. Watch
-it with `journalctl -u cmp50hx-gen2 -b`; a `PASS` line means the link is
-at 5.0 GT/s.
+## Two ways to run it
 
-**Stuck at Gen1 (2.5 GT/s) after every cold boot?** Check the BIOS first:
-set the GPU slot's **PCIe link speed to Gen2** (not Auto/Gen1). The card
-only keeps its Gen2 capability through GSP boot when the link policy
-registers come up in the Gen2-ready state (`PL_LINK_RATE` bit 20 clear),
-and that bit is hardware-controlled — no driver or EFI write can change
-it (proven on an X79 host 2026-09-17: with the BIOS slot set to Gen2 the
-same patch stack trains 5.0 GT/s on every cold boot; without it, nothing
-OS-side could recover Gen2 after a real power-off). The dmesg tell is
-`CMP50_GEN2: POLICY_PASS phase=post-booter … PL=00340032` (bit 20 set =
-locked) versus `PL=00240032` (Gen2 will stick).
+**1. Patched driver (recommended, needs Secure Boot off or an enrolled MOK).**
+The kernel module performs the privileged write inside its own boot, at the point
+where nothing overwrites it. This is what produces the numbers above, and it is
+what the project's own `install.sh` sets up.
 
-When the installer prints `PASS_CMP_INITRAMFS`, reboot to load the patched
-module at boot:
+```sh
+git clone <this repo> cmp50hx-unlock && cd cmp50hx-unlock
+sudo ./install.sh --card cmp50hx      # installs the 610.43.03 userland + patched modules
+sudo reboot
+cd verify && ./rm_issue_rate 0 > /tmp/rm.json && python3 verify.py /tmp/rm.json
+```
 
-```bash
+**2. Userspace unlock, before the driver binds (Secure Boot can stay on).**
+For hosts where loading a locally built module is impossible. `userspace-unlock/`
+contains a complete port of the EFI exploit that talks to the card through
+`vfio-pci` in no-IOMMU mode, with DMA buffers in hugepages, and writes the same
+registers through the SEC2 booter.
+
+```sh
+cd userspace-unlock && make
+sudo ./install.sh --fb 20g            # systemd unit, runs before nvidia
 sudo reboot
 ```
 
-Rollback: `sudo /opt/cmp50hx-unlock/install-initramfs.sh --rollback` restores
-the previous initramfs; module backups are under
-`/opt/cmp50hx-unlock/backups/`.
+> **Read this before choosing it.** The userspace unlock is proven at the
+> register level (`NV_PFEAT` at `0x409668` goes from clamped to `0x00000000`),
+> but the *stock* driver re-applies the fused selectors during GR init, so on its
+> own it does not survive into the running system. Use it together with a driver
+> that does not re-clamp. The full analysis, including every path that was tried
+> and why each is closed, is in
+> [userspace-unlock/RESULTS.md](userspace-unlock/RESULTS.md).
 
-Notes:
+## Requirements
 
-- Secure Boot must be disabled, or the unsigned module will not load (the
-  installer warns). This is separate from the EFI unlock app: its signature
-  can be trusted by firmware `db`; see [`efi-unlock/README.md`](efi-unlock/README.md).
-- Tested subsystem boards are `10de:1554` and `1462:371f`; other `10de:1e09`
-  boards only get a warning.
-- Ubuntu, Debian, and their derivatives work; Linux Mint is tested.
-- The build downloads the NVIDIA source archive and the `.run` package into
-  `/opt/cmp50hx-unlock/cache`; re-runs reuse them.
-- Real RT execution stays impossible; this unlocks full SM/Tensor speed, the
-  16 GiB BAR1, and PCIe Gen2 (see [`docs/CMP50HX.md`](docs/CMP50HX.md)). The
-  five-library user-space audit and the negative forced-compiler comparison are
-  in
-  [`docs/CMP50HX-SHARED-OBJECT-AUDIT.md`](docs/CMP50HX-SHARED-OBJECT-AUDIT.md).
+* NVIDIA CMP 50HX — `10de:1e09`. Nothing else is touched.
+* Linux, kernel headers for the running kernel, `gcc`, `make` (the installer
+  fetches what it needs on Ubuntu/Debian).
+* The driver-side path needs either **Secure Boot off** (`OS Type = Other OS`) or
+  the local signing key enrolled through MokManager.
+* **20 GiB cards need `--fb 20g`.** The FB-range register still reports the stock
+  10 GiB on memory-modified cards and the booter rejects the layout otherwise.
+  Check with `nvidia-smi --query-gpu=memory.total`.
 
-## Optional userspace pipeline-bind patch
+## Documentation map
 
-[`userspace-patch/`](userspace-patch/README.md) makes a private copy of the
-NVIDIA 610.43.03 `libnvidia-eglcore.so` and removes the validated CMP50HX
-Vulkan pipeline-bind delay. It scans and patches exactly two byte-pattern
-matches, never overwrites `/usr/lib`, and includes a native ELF launcher that
-uses the system loader's `--library-path` without setting `LD_LIBRARY_PATH`.
-This is based on the research in [Cyridd/cmpunlocker](https://github.com/Cyridd/cmpunlocker)
-and is separate from the kernel-module unlock. It does not prove an RT-core or
-general shader unlock.
-
-The separate eglcore RT-capability study is summarized in
-[`docs/CMP50HX.md`](docs/CMP50HX.md#eglcore-class-and-rt-exposure-map). It maps
-the exact extension records, the `RT_CORE_COUNT && profile 0x0e3595` gate,
-compiler consumers, validation-only environment/profile control, RT task
-priority defaults, and the read-only live enumeration. These userspace paths
-are already open on the tested card except for extensions with additional
-class/state conditions; none makes the SM accept the faulting ray instruction.
-
-## Idle power: optional governor
-
-The card idles at **62–64 W** doing nothing, and it never lowers its own
-P-state request: even an explicit `min,max` range lock is resolved to the
-maximum. The private NVAPI P-state control can force the card to P8 at about
-**1.8 W**.
-
-[`idle-governor/`](idle-governor/README.md) supplies that P-state request
-automatically — force P8 when idle, release to P16 when work appears:
-
-The active service is a single C ELF, `cmp-governor`. It calls NVML and the
-private NVAPI entry point directly; Bash, Python, and `nvidia-smi` are not in
-the runtime path.
-
-| | Idle | Under load |
-|---|---|---|
-| without | 62–64 W | full clocks |
-| with | **1.8 W (P8)** | full clocks, restored within one poll |
-
-About **−61 W per idle card**. It is optional, independent of the unlock, and
-keeps runtime state only (stopping it releases the forced state). Enable during
-install with `--idle-governor`, or later:
-
-```bash
-sudo systemctl enable --now cmp-idle-governor
-```
-
-Trade-off: a job starting while the card is in P8 runs at the idle clock for
-up to one poll interval (5 s by default, tunable). Details, measurements, and
-tuning: [`idle-governor/README.md`](idle-governor/README.md).
-
-## Tuning: optional profiles
-
-[`tuning/`](tuning/README.md) adds `cmp-tune`, a profile-driven utility for
-power limit, core/memory VF offsets and the locked core-clock range. It uses
-NVML directly (via `ctypes`, no build step) because `nvidia-smi` cannot set VF
-offsets.
-
-```bash
-cmp-tune list                    # profiles
-cmp-tune status                  # live state + the ranges your card reports
-cmp-tune show efficient          # dry run
-sudo cmp-tune apply efficient
-sudo cmp-tune reset
-```
-
-Profiles live in `/etc/cmp-tune.conf`; every key is optional:
-
-```ini
-[efficient]
-power_w = 170
-core_offset = 225
-mem_offset = 1000
-clock_max = 2100
-```
-
-Key behaviours:
-
-- **Bounds come from the card.** Omit `clock_min` and the card's own minimum
-  supported clock is used (omit `clock_max` and its maximum is), so a lock
-  always stays inside the card's real range. Every value is validated against
-  what the card reports and an out-of-range profile is refused with the exact
-  limits.
-- **Only CMP cards are touched** — CMP 50HX (`10de:1e09`) and CMP 90HX
-  (`10de:220d`), matched by PCI ID. Any other GPU is listed and skipped.
-- **Multi-GPU:** applies to every CMP card by default, `-i N` for one.
-- **Composes with the idle governor:** applying a profile writes the C
-  governor's clock, core offset, memory offset, and power settings to its
-  systemd drop-in. The clock lock and core offset are cleared while P8 is
-  forced and restored when work appears.
-
-Settings are runtime state and clear on reboot, by design.
-
-## Fresh performance results
-
-| Path | Result |
-|---|---:|
-| RM issue-rate and core-count gate | `PASS_CMP50HX_ISSUE_RATE_AND_COUNTS` |
-| DP4A | `2782.422981` G thread-instructions/s |
-| DP2A pair | `4435.776603` G thread-instructions/s |
-| FFMA | `2584.518335` G thread-instructions/s |
-| FMUL + FADD | `4404.996610` G thread-instructions/s |
-| FP16 Tensor WMMA | `106.819293 TFLOPS`, correct |
-| OpenCL FP64 | `0.419 TFLOPS` |
-| OpenCL FP32 | `13.501 TFLOPS` |
-| OpenCL FP16 | `26.872 TFLOPS` |
-| OpenCL INT64 | `3.479 TIOPS` |
-| OpenCL INT32 | `13.055 TIOPS` |
-| OpenCL INT16 | `11.398 TIOPS` |
-| OpenCL INT8 | `48.272 TIOPS` |
-| OpenCL coalesced read/write | `504.98 / 474.54 GB/s` |
-| OpenCL misaligned read/write | `419.44 / 124.30 GB/s` |
-| OpenCL PCIe send/receive | `1.70 / 1.70 GB/s` |
-| OpenCL PCIe bidirectional | `1.69 GB/s` |
-| Pinned CUDA PCIe H2D/D2H | `1.701960 / 1.708828 GB/s`, correct |
-
-
-## Evidence rules
-
-The guide uses these labels:
-
-- **S — source:** directly visible in the patch and its control flow;
-- **I — IDA:** a checked function, instruction, xref, or data path in the open
-  TU102 GSP IDB;
-- **L — live:** a result from the installed CMP50HX package or the read-only
-  performance matrix;
-- **A — apply/build:** the split series applies to a clean official source tree
-  and produces the same changed source files as the old monolithic patch.
-
-The IDA database is
-[`gsp_tu10x_610.43.03.elf.i64`](decompil/gsp_tu10x_610.43.03.elf.i64),
-binary SHA-256
-`c10c2866e360154e822087957bc4269168e44f8d45922110e67fd751355806f9`.
-It is the GSP firmware, not the Linux host driver. Therefore it can prove the
-stock firmware control surface, but it cannot prove a C change in
-`kernel-open/nvidia/*.c`. No debugger was used. IDA work used xrefs, operand
-values, scoped disassembly, and decompilation; names and comments are notes,
-not primary proof.
-
-**A:** the series was dry-run and applied to the clean official archive whose
-SHA-256 is
-`9df87d753cd9c05aa0eedc462af9b35debb549a657136e863282f94c96ee2640`. The
-builder repeats the source hash check and applies the four files in the order
-shown in [`build.sh`](build.sh).
-
-## 1. `01-cmp50-stockflow.patch`
-
-### Purpose
-
-This is the firmware/RM patch. It keeps the NVIDIA stock Booter and GSP-RM
-flow, but adds a CMP50-only, bounded transaction around the signed Booter
-image. Its useful result is the normal full SM issue-rate state. It is not an
-RT-fuse unlock and it is not a host PCIe link retrain by itself.
-
-### Files and roles
-
-| File | Role |
+| Document | What is in it |
 | --- | --- |
-| `generated/g_kernel_gsp_nvoc.h` | Stores a private copy of the stock signature and its size. |
-| `kernel/gpu/gsp/kernel_gsp.c` | CMP50 gate, signature allocation/replacement, stock-signature restore, and boot-state logs. |
-| `arch/turing/kernel_gsp_booter_tu102.c` | Falcon/SEC2 checks, native Booter launch, WPR/FECS readback, and cleanup. |
-| `arch/turing/kernel_gsp_falcon_tu102.c` | Per-BDF exploit-mode state and a Booter-only bounded halt wait. |
-| `arch/turing/kernel_gsp_tu102.c` | Retry state, fresh WPR metadata, GSP-ready checks, and the TU102 PCIe policy gate. |
+| [INSTALL.md](INSTALL.md) | step-by-step installation, verification, rollback, troubleshooting |
+| [userspace-unlock/README.md](userspace-unlock/README.md) | how the userspace unlock works and why it is built this way |
+| [userspace-unlock/RESULTS.md](userspace-unlock/RESULTS.md) | every measurement and every negative result, with the register evidence |
+| [userspace-unlock/BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md) | Secure Boot, serial console and PCIe link speed on an ASUS X99-E WS |
+| [userspace-unlock/HANDOVER.md](userspace-unlock/HANDOVER.md) | state of a deployed host, what is proven, what is left |
+| [docs/CMP50HX.md](docs/CMP50HX.md) | reverse-engineering notes: fuses, registers, GSP, RT cores |
+| [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md) | the original project README (patch-by-patch validation) |
+| [efi-unlock/README.md](efi-unlock/README.md) | the pre-OS UEFI unlock and its risks |
 
-### Step-by-step behavior
+## What is not solved here
 
-1. **Gate the card.** Every special path checks the packed device and one of
-   the two packed subsystem IDs above. Other GPUs take the stock path.
+* **PCIe Gen2.** The card is locked to Gen1 in its own link policy and the
+  patch can only adopt Gen2 when the card comes up Gen2-ready at POST. Behind a
+  PLX switch (as on the X99-E WS, where every x16 slot sits behind a PEX8747)
+  that never happens. Measured, documented, and closed — see
+  [userspace-unlock/BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md). Gen1 x16 is
+  4 GB/s and bounds only host↔GPU transfers.
+* **ReBAR / RT core count.** Separate patches exist in `patches/` and are
+  documented in the upstream README; they are not part of the compute unlock.
 
-2. **Keep a recovery copy.** During signature-memdesc creation the patch saves
-   the original firmware signature in `KernelGsp::pStockSignatureData` and
-   records `stockSignatureSize`. The normal allocation is changed to a fixed
-   `0xFA00` backing size only for the CMP50 target.
+## Safety
 
-3. **Prepare the synthetic signature.** The new buffer is first filled with
-   `0x00000CBD`. Selected dwords then form the bounded Booter transaction. The
-   important values are:
+The unlock writes GPU registers from a signed SEC2 booter. A card that stops
+responding mid-run stays that way until a power cycle. It does not flash
+anything, does not modify the VBIOS, and is reversed by removing the patched
+modules and rebooting ([INSTALL.md](INSTALL.md#rollback)).
 
-   | Signature offset/value | Meaning used by the patch |
-   | --- | --- |
-   | `0x0000 = 0x00020001`, `0x0880 = 0x344`, `0x0884 = 1` | stock-looking header and LS metadata |
-   | `0xF974 = 0x00409650` | FECS feature-override protection register |
-   | `0xF988 = 0x88888888`, `0xBB20 = 8` | full-speed SM selector values |
-   | `0xF9A4 = 0x00409664`, `0xBB38 = 0x0040966C` | FECS SM selector addresses |
-   | `0xBB4C = 0xFFFFFF8F` | final FECS protection mask |
-   | `0xBB98 = 0x8E1B0`, `0xBBC8 = 0x8E110`, `0xBBF8 = 0x8E12C`, `0xBC28 = 0x8E11C` | TU102 XP3G policy writes |
-   | `0xBC58/0xBCB8 = 0x1FA828/0x1FA824` | WPR2 high/low state |
-   | `0xBC88/0xBCE8 = 0x8403C4` | SEC2 reset-protection register |
+## Credits and license
 
-   The patch calls these values guards, pivots, writers, PLM, WPR2, or cleanup
-   tails. Those names explain intent; they do not by themselves prove that an
-   arbitrary firmware payload is safe.
+This is a fork of **[xrip/cmp50hx-unlock](https://github.com/xrip/cmp50hx-unlock)**
+— the EFI unlock, the driver patches, the firmware extraction and the
+reverse-engineering notes are that project's work. This fork adds the userspace
+implementation (`userspace-unlock/`), the measurements above and the deployment
+tooling, and keeps the original documentation verbatim in `docs/`.
 
-4. **Use fresh WPR metadata.** `_kgspCmp50ExecuteBooterFreshMeta` allocates a
-   new 4 KiB metadata page, copies the canonical WPR metadata into it, launches
-   the stock `kgspExecuteBooterLoad_HAL`, copies Booter's mutations back, and
-   frees the temporary page. This prevents SEC2 from reusing a stale metadata
-   DMA page on the second launch.
+Licensed under **copyleft-next 0.3.1**, the same license as upstream — see
+[LICENSE](LICENSE) and [NOTICE](NOTICE). NVIDIA firmware remains under NVIDIA's
+own terms.
 
-5. **Run Booter only in exploit mode.** `kernel_gsp_falcon_tu102.c` stores the
-   mode by stable bus/device index. `kgspExecuteHsFalcon_TU102` uses the longer
-   `250000`-unit halt wait only when the exact CMP50 board is in exploit mode
-   and the ucode is the Booter-load image. All other Falcon launches keep the
-   default timeout.
+---
 
-6. **Check the handoff, then clean SEC2.** The Booter path requires the exact
-   state before it returns success: FECS PLM `0xFFFFFF8F`, FECS selectors
-   `0x88888888` and `0x00000008`, WPR2 down (`HI=0`, `LO=0x1FFFFE00`), SEC2
-   reset PLM `0xFF`, and a clear mailbox. The patch can accept mailbox1 values
-   `0`, `1`, or `4` only after all other checks pass. The SEC2 cleanup path waits
-   for halt, checks the reset PLM, resets SEC2 once, checks both mailboxes, and
-   zeroes SEC2 DMEM over `[0, 0x10000)`.
+## Кратко по-русски
 
-7. **Restore the stock signature when the transaction is done.**
-   `kgspCmp50RebuildStockSignature` maps the original signature memdesc, clears
-   it, copies back the saved stock bytes, updates WPR metadata, flushes CPU
-   caches, and logs the physical address and advertised size. The saved buffer
-   is freed on the normal cleanup path.
+Репозиторий снимает ограничитель **FP32 и INT8 (DP4A)** с NVIDIA CMP 50HX
+(`10de:1e09`): было 0.40 TFLOP/s, стало **12.9 TFLOP/s** (≈32×), состояние
+переживает перезагрузку и обесточивание, подтверждается интерфейсом самого
+драйвера (`SM_ISSUE_RATE_MODIFIER` = все нули).
 
-8. **Apply the GSP-side Gen2 policy at two gates.**
-   `s_cmp50ApplyGen2Policy` runs after the Booter transaction and again at
-   `gsp-ready`. It first requires the XP3G PLM readout to be `0xFFFFFFFF`, then
-   saves the old values, writes the TU102 policy, reads every value back, and
-   rolls back on a mismatch. Its checked policy includes:
+* Основной путь — патченный драйвер `610.43.03`: `sudo ./install.sh --card cmp50hx`, затем перезагрузка. Нужен выключенный Secure Boot либо зачисленный MOK-ключ.
+* Альтернатива для хостов, где модуль загрузить нельзя — `userspace-unlock/`: анлок из userspace до загрузки драйвера (vfio + hugepages). Механизм доказан, но стоковый драйвер перезаписывает селекторы — подробности и все отрицательные результаты в `userspace-unlock/RESULTS.md`.
+* Для карт на 20 ГБ обязателен `--fb 20g`.
+* PCIe Gen2 на платах с PLX-коммутатором недостижим — это ограничение платы, на вычисления не влияет.
 
-   - `0x8841C` private misc Gen2 enable/value bits;
-   - `0x88610` VSEC hierarchy;
-   - `0x8C2C0` CYA bit 2 clear;
-   - `0x8C040` link policy field `2`;
-   - `0x8C1C0` link-rate field `0x40000`;
-   - `0x8872C` LTSSM value `6`.
-
-   This is only the GSP policy half. The endpoint/bridge PCI config write and
-   retrain are in patch 04.
-
-### IDA proof for the stock control surfaces
-
-The firmware IDB gives strong evidence for the two stock surfaces that this
-patch reuses:
-
-- `pcie_apply_link_speed_policy` at `0x4CB25B8` is the stock
-  `RMPcieLinkSpeed` policy routine. Scoped RISC-V disassembly shows writes to
-  the mirrors `0x880A8`, `0x8841C`, `0x8C040`, `0x8C1C0`, and `0x8C2C0`.
-  At `0x4CB276C` the target-speed field at `0x880A8` is set to `2`; alternate
-  branches at `0x4CB28A4` and `0x4CB2D08` set `4` and `3`. The routine reads
-  `0x8C040` beside the current-speed mirror `0x88088` at `0x4CB2978`.
-- The TU102 SM override callback at `0x528F508` has two checked indirect
-  writes. The first constructs register ID `0x9664` (`lui 9` + `addi 0x664`);
-  the second loads `0x966C`. Both use the object at `Graphics+0x1200` and its
-  virtual slot `+0x40`. Data xrefs at `0x5B8DE04` and `0x5B8DE0C` install this
-  callback.
-- `kgraphicsApplyInitOverrides_inferred` at `0x52A5840` loads the
-  `Graphics+0xB08` callback slot and calls it at `0x52A5A4C` with
-  `RMOverrideSmSpeedSelect`, then at `0x52A5A8C` with
-  `RMOverrideSmSpeedSelect1`. The callback return is ignored on this path.
-- A bounded structured instruction scan found the two expected constructions
-  (`0x9664` and `0x966C`) and no `0x9670` or `0x9674` construction in this
-  selected path. This is why the current patch keeps the TU102 reg-map path
-  and does not port the alternate OBJFUSE writer.
-- The same scoped scan found no direct stock-GSP construction of `0x8E1B0`.
-  Therefore the XP3G PLM write is a CMP50 patch addition, not a claim that the
-  unmodified 610.43.03 firmware already performs that write.
-
-IDA proves the stock policy and callback wiring. It does **not** prove that the
-hard-coded synthetic signature is safe or that a host build will accept it.
-Those claims require the source checks, the exact runtime readback, and a
-failure/rollback test.
-
-### Live result and limits
-
-**L:** The installed package reports full issue-rate fields and survives a cold
-boot. The performance matrix records
-`PASS_CMP50HX_ISSUE_RATE_AND_COUNTS`, P0 at 1905 MHz, no new NVRM/Xid/AER/PCIe
-errors, and useful CUDA/Tensor throughput. See
-[`artifacts/cmp50-performance-matrix-20260817/VERIFY.md`](../../../artifacts/cmp50-performance-matrix-20260817/VERIFY.md).
-
-The result proves the tested card reached the intended compute state. It does
-not prove that every word in the synthetic signature is needed on every TU102
-board. The BDF gate, exact readbacks, stock-signature restore, and fail-closed
-branches are therefore part of the patch, not optional cleanup.
-
-## 2. `02-cmp50-rt-core-count.patch`
-
-### Purpose and code path
-
-This is a small host/RM reporting patch. In
-`kgraphicsLoadStaticInfo_KERNEL`, after the normal graphics static-info copy,
-it checks the exact packed CMP50 device and subsystem IDs and sets
-`NV2080_CTRL_GR_INFO_INDEX_RT_CORE_COUNT` to `56`.
-
-The change affects the value returned by RM and the host API gate. It does not
-change SM decode, the RT fuse, dispatch, clocks, power, or the firmware GR
-init path. In particular, “RM reports 56” must not be written as “56 physical
-RT cores are executable.”
-
-### Evidence
-
-- **S:** one hunk, one field, one exact BDF gate; no other graphics state is
-  changed.
-- **I:** the open GSP IDB cannot prove this host Linux C hunk. It is the wrong
-  binary for that claim, so the correct IDA result is **not applicable**, not a
-  guessed firmware match.
-- **L:** the verifier reports `3584` CUDA, `448` Tensor, and `56` RT cores, while
-  the project’s RT tests still fail at SM decode because of the physical RT
-  fuse. This is a report/API result only.
-
-## 3. `03-cmp50-rebar.patch`
-
-### Purpose
-
-This patch changes the TU102 XVE ReBAR configuration early enough in the Linux
-PCI probe that Linux can build a large BAR1 resource window. It does not alter
-the GSP image and does not make a board with a too-small host bridge capable of
-using a large aperture.
-
-### Step-by-step behavior
-
-1. A read-only module parameter selects the size: `0` disables the path and
-   `1..8` select `128 MiB..16 GiB`; the default is `8`.
-2. The exact CMP50 BDF is checked. BAR0 must be memory-mapped and at least
-   `0x89000` bytes long.
-3. The function maps the 4 KiB XVE page at BAR0 offset `0x88000` and reads:
-
-   | XVE offset | Role |
-   | ---: | --- |
-   | `0x724` | CYA unlock register; write `0x30` |
-   | `0xBBC` | ReBAR capability readback |
-   | `0xDCC` | ReBAR configuration; bit 31 enables, low nibble is the selector |
-
-4. It preserves all other configuration bits, clears the old low-nibble size,
-   sets enable plus the selected size, writes CYA then CFG, and reads both back.
-5. It checks `pci_rebar_get_possible_sizes()` using `BIT(selector + 6)`. If the
-   XVE readback or the PCI capability mask does not support the choice, it
-   restores the old CFG and CYA values and fails probe.
-6. On success it enables the existing NVIDIA ReBAR resize path and logs the
-   selector, capability mask, old/new values, and final BAR1 size.
-
-The code only compares the enable and size bits for CFG readback. The CYA
-read is recorded and logged, but is not independently asserted; this is a real
-review point for a future hardening patch.
-
-### Evidence and limits
-
-- **S:** the write/verify/rollback sequence is visible in
-  `kernel-open/nvidia/nv-pci.c`; this is host PCI MMIO code.
-- **I:** the GSP IDB is not a proof source for this Linux PCI probe function.
-  Do not cite the firmware IDA address `0x880A8` as proof of the ReBAR offsets:
-  the ReBAR addresses are BAR0 `0x88000 + {0x724,0xBBC,0xDCC}`.
-- **L:** the live package and host notes show `cmp50_rebar_size=8`, a 16 GiB
-  BAR1, and a clean cold boot. The host firmware and bridge still have to
-  provide a compatible aperture.
-
-## 4. `04-cmp50-pcie-gen2.patch`
-
-### Purpose
-
-Patch 01 prepares and checks the GSP-side TU102 policy. This patch completes the
-host side: it programs the PCIe endpoint and its upstream bridge, asks the
-bridge to retrain, and waits for an active 5.0 GT/s link.
-
-### Step-by-step behavior
-
-1. `nv_cmp50hx_is_supported()` applies the exact split Linux BDF gate.
-2. `nv_cmp50hx_retrain_gen2()` finds the upstream bridge and maps the first
-   `0x90000` bytes of GPU BAR0.
-3. Before touching PCI config space it requires the GSP policy mirror to show:
-
-   - CYA `0x8C2C0`, bit 2 clear;
-   - link config `0x8C040`, bits `[19:18] == 2`;
-   - PL link rate `0x8C1C0`, speed field `0x00040000`.
-
-   If the GSP half did not pass, the host half skips the retrain.
-4. After GSP/RM starts, it records the BAR0/XVE mirrors and the endpoint and
-   upstream PCIe capabilities before and after each important phase under
-   `CMP50_PCIE_DIAG_V1`.
-5. It writes LTSSM `6` at BAR0 `0x8872C`, reads it back, and waits 50 ms.
-6. It sets `PCI_EXP_LNKCTL2_TLS_5_0GT` on both the GPU and the bridge, sets
-   `PCI_EXP_LNKCTL_RL` on the bridge, and polls the GPU link status up to 20
-   times at 100 ms intervals.
-7. Success requires the active link status class to be at least
-   `PCI_EXP_LNKSTA_CLS_5_0GB`; the driver logs `RETRAIN_PASS mode=normal`.
-
-The tested CMP50HX path does not use a Link Disable cycle. See
-`docs/CMP50HX-PCIE-LINK-DISABLE-AUDIT.md` for the live negative result.
-
-### IDA proof and live result
-
-**I:** `pcie_apply_link_speed_policy` at `0x4CB25B8` is the stock reason these
-mirrors are plausible. Its disassembly directly writes `0x880A8`, `0x8841C`,
-`0x8C040`, `0x8C1C0`, and `0x8C2C0`, and its `RMPcieLinkSpeed` xrefs drive the
-same policy branches listed in the patch. The IDB shows the stock policy
-surface; the Linux writes and retrain still require host-source and live proof.
-
-**L:** the tested package reaches an active `5.0 GT/s x4` link on both endpoint
-and upstream bridge, with PCIe transfer rates around `1.70--1.71 GB/s` and no
-new PCIe/AER errors. See the performance matrix linked above.
-
-The patch deliberately does not add GA100-only OPT or unrelated XP3G register
-writes. The extra XP3G policy in patch 01 is guarded by exact CMP50/TU102
-readback; it must not be copied to another architecture without a new IDA and
-runtime proof.
-
-## How to reuse this work
-
-For a future CMP50HX patch, keep this order:
-
-1. Prove the exact BDF gate in the target source and in the live host.
-2. Classify the change as firmware/RM, host PCI, host reporting, or a mix.
-3. In IDA, start from xrefs and operand/immediate construction. Confirm the
-   call path, register owner, read/write direction, and nearby rollback or
-   reset behavior. Do not use a string match as the only proof.
-4. Write the smallest source change. Keep readback and rollback beside each
-   write. Keep an unsupported board on the stock path.
-5. Apply the patch to a clean, hash-checked source tree with `patch --dry-run`
-   first. Then build and check module strings, ABI, and source markers.
-6. On hardware, record the before/after register or API value, active link or
-   core state, dmesg delta, and cold-boot result. A success log without a
-   readback is not enough.
-7. Record negative evidence too: a missing IDA writer, a read-only register, a
-   physical fuse failure, or an unsupported capability is useful project data.
-
-The package builder applies this exact order:
-
-1. stockflow and GSP policy;
-2. RM RT-count report;
-3. host ReBAR setup;
-4. host PCIe endpoint/bridge retrain.
-
-See [`build.sh`](build.sh) and [`docs/CMP50HX.md`](docs/CMP50HX.md) for the
-operational and runtime limits.
+Подробная инструкция: [INSTALL.md](INSTALL.md).

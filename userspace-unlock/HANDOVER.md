@@ -46,7 +46,7 @@ The project's driver-side patch is the only mechanism that survives, and its
 module has to be signed by an enrolled key.
 
 ```sh
-sudo /home/lmserver/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh
+sudo /opt/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh
 ```
 
 installs the 610.43.03 userland and patched modules, signs them, queues the key

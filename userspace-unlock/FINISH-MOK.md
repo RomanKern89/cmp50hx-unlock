@@ -20,7 +20,7 @@ Everything except the enrolment is automated.
 ## Step 1 — everything that can be automated (no person needed)
 
 ```sh
-sudo /home/lmserver/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh
+sudo /opt/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh
 ```
 
 It installs the 610.43.03 userland and the patched modules, signs the modules
@@ -47,9 +47,9 @@ Enroll MOK -> Continue -> Yes -> <root password> -> Reboot
 ```sh
 sudo ./finish-mok.sh --check          # module version, signer, enrolment
 cat /sys/module/nvidia/version        # 610.43.03
-cd /home/lmserver/cmp50hx-unlock/verify
+cd /opt/cmp50hx-unlock/verify
 ./rm_issue_rate 0 > /tmp/rm.json && python3 verify.py /tmp/rm.json
-cd /home/lmserver/cmp50hx-unlock/userspace-unlock && ./cmp50-fma 200000 0
+cd /opt/cmp50hx-unlock/userspace-unlock && ./cmp50-fma 200000 0
 ```
 
 Success looks like `PASS_CMP50HX_ISSUE_RATE_AND_COUNTS` and a large jump in
@@ -61,7 +61,7 @@ If MokManager is skipped or the patched driver does not come up, SSH still
 works and the stock module is untouched:
 
 ```sh
-sudo /home/lmserver/cmp50hx-unlock/userspace-unlock/tools/rollback-patched.sh
+sudo /opt/cmp50hx-unlock/userspace-unlock/tools/rollback-patched.sh
 sudo reboot
 ```
 

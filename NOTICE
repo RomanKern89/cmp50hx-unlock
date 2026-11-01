@@ -1,0 +1,54 @@
+# NOTICE
+
+## Upstream project
+
+This repository is a **fork of [xrip/cmp50hx-unlock](https://github.com/xrip/cmp50hx-unlock)**.
+
+That project is the origin of everything that makes the unlock possible: the
+reverse-engineering of the SEC2 booter path and the FECS speed selectors, the
+`610.43.03` driver patches (`patches/cmp50hx/`), the firmware extraction tooling
+(`efi-unlock/extract_*.py`), the UEFI implementation (`efi-unlock/`,
+`efi-unlock-windows/`), the register and fuse notes in `docs/`, the RT-core and
+ReBAR work, and the original documentation, kept verbatim in
+`docs/UPSTREAM-README.md` and `docs/UPSTREAM-README.RU.md`.
+
+## What this fork adds
+
+* `userspace-unlock/` — an independent userspace implementation of the same
+  hardware sequence: vfio-pci in no-IOMMU mode for BAR0 and bus master,
+  hugepage DMA buffers with physical addresses from `pagemap`, the FWSEC and
+  SEC2 booter port loads, the WPR meta and radix-3 layout, plus the deployment
+  tooling (`install.sh`, systemd unit, MOK helpers) and the diagnostics
+  (`usplat`, `cmp50-regs`, `cmp50-fma`, `cmp50-dp4a`).
+* `userspace-unlock/RESULTS.md`, `BIOS-SETUP.md`, `HANDOVER.md`, `FINISH-MOK.md`
+  — the measurements, the negative results, and the board-level notes gathered
+  while validating both paths on real hardware.
+* `INSTALL.md` and the front-page `README.md`.
+
+## What is deliberately not published
+
+* `decompil/gsp_tu10x_610.43.03.elf.i64` — a 318 MB IDA database derived from
+  NVIDIA firmware. It is a reverse-engineering artefact rather than something a
+  user needs, it exceeds practical repository limits, and it is available from
+  the upstream project. The analysis it supports is summarised in
+  `docs/CMP50HX.md`.
+* No credentials, host names or private addresses: the documents use `/opt/...`
+  paths and `<host>` placeholders.
+
+## Firmware and driver binaries
+
+`efi-unlock/blobs/` contains NVIDIA firmware blobs (the SEC2 booter image, the
+GSP firmware fragments, the board FWSEC) and `patches/` contains source patches
+for the NVIDIA open kernel modules. They come from NVIDIA's own driver packages
+and from the card's VBIOS, are redistributed here exactly as upstream
+redistributes them, and remain subject to NVIDIA's licence terms. They are used
+only to interoperate with hardware the user owns.
+
+`efi-unlock-windows/tools/` contains prebuilt Windows executables from upstream;
+their sources are next to them.
+
+## Licence
+
+This repository is distributed under **copyleft-next 0.3.1**, the licence of the
+upstream project — see `LICENSE`. Any redistribution or derivative work must keep
+that licence and this attribution.

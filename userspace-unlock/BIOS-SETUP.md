@@ -138,10 +138,10 @@ Connect with `screen /dev/ttyUSB0 115200` (or PuTTY in serial mode).
 ## 5. After Secure Boot is off
 
 ```sh
-sudo /home/lmserver/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh
+sudo /opt/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh
 sudo reboot
-sudo /home/lmserver/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh --check
-cd /home/lmserver/cmp50hx-unlock/verify && ./rm_issue_rate 0 > /tmp/rm.json && python3 verify.py /tmp/rm.json
+sudo /opt/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh --check
+cd /opt/cmp50hx-unlock/verify && ./rm_issue_rate 0 > /tmp/rm.json && python3 verify.py /tmp/rm.json
 ```
 
 Expected: the patched `610.43.03` driver loads, `verify.py` prints
