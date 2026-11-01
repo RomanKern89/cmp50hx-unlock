@@ -11,9 +11,8 @@ PAYLOAD_TGZ     := cmp50hx-unlock-linux.tar.gz
 WIN_ZIP         := cmp50hx-unlock-windows.zip
 STAGE_DIR       := .release-stage
 VERSION         ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-SHA             := $(shell sha256sum $(PAYLOAD_TGZ) 2>/dev/null | awk '{print $$1}')
 
-.PHONY: all release efi win clean
+.PHONY: all release release-linux efi win clean
 
 all: release
 
@@ -32,16 +31,21 @@ $(PAYLOAD_TGZ): efi
 	cp efi-unlock/README.md                                 $(STAGE_DIR)/
 	tar -C $(STAGE_DIR) -czf $(PAYLOAD_TGZ) .
 	sha256sum $(PAYLOAD_TGZ) > $(PAYLOAD_TGZ).sha256
-	@echo "wrote $(PAYLOAD_TGZ) ($(shell wc -c < $(PAYLOAD_TGZ)) bytes)"
+	@echo "wrote $(PAYLOAD_TGZ) ($$(wc -c < $(PAYLOAD_TGZ)) bytes)"
 
+# The hash must be taken inside this recipe: the tarball depends on the phony
+# "efi" target, so it is rebuilt as part of this same run and a hash computed
+# at parse time is stale ("SHA mismatch" on every clean `make release`).
 $(INSTALLER): $(PAYLOAD_TGZ)
+	@sha=$$(sha256sum $(PAYLOAD_TGZ) | awk '{print $$1}'); \
 	CMP_VERSION=$(VERSION) \
 	CMP_RELEASE_URL="file://$$(pwd)/$(PAYLOAD_TGZ)" \
-	CMP_RELEASE_SHA=$(SHA) \
+	CMP_RELEASE_SHA="$$sha" \
 	  bash tools/build-linux-installer.sh \
 	    --tar $(PAYLOAD_TGZ) \
-	    --out $(INSTALLER)
-	@echo "wrote $(INSTALLER) ($(shell wc -c < $(INSTALLER)) bytes)"
+	    --out $(INSTALLER) \
+	    --sha256 "$$sha"
+	@echo "wrote $(INSTALLER) ($$(wc -c < $(INSTALLER)) bytes)"
 
 # ------------------------------------------------------------------
 # Windows side (requires Go 1.23+ on PATH; PowerShell for the zip)
@@ -54,6 +58,13 @@ win:
 # ------------------------------------------------------------------
 # Aggregate
 # ------------------------------------------------------------------
+# Linux side only: no Go or pwsh required, so this works on a bare host.
+release-linux: $(INSTALLER)
+	@echo
+	@echo "===== Linux installer ====="
+	ls -la $(INSTALLER) $(PAYLOAD_TGZ) $(PAYLOAD_TGZ).sha256
+	@echo "User install: sudo ./$(INSTALLER)"
+
 release: $(INSTALLER) win
 	@echo
 	@echo "===== Linux installer ====="
