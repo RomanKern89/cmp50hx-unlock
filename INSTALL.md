@@ -75,6 +75,17 @@ second run needs no network), builds the patched modules with
 `depmod`, installs the optional units, and rebuilds the initramfs. It never
 reboots and never unloads a live driver.
 
+Two defaults worth knowing:
+
+* The installer re-fetches the tree into `/opt/cmp50hx-unlock`, so the installed
+  copy is exactly what it was run from. `CMP_UNLOCK_REPO_TARBALL=<url>` installs
+  from a different fork or ref.
+* `cmp50hx-gen2.service` is installed but **not enabled**. On a board whose slot
+  comes up with the PCIe link policy locked, it can only loop, and a retrain
+  while the policy is locked has wedged the card. Pass `--gen2` only if
+  `dmesg` shows `CMP50_GEN2: POLICY_PASS ... bit 20 clear` (see
+  [BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md)).
+
 ### A3. Reboot and confirm
 
 ```sh
