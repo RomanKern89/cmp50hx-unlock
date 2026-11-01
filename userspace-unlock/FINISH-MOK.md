@@ -1,98 +1,99 @@
-# Finishing the unlock after the MOK key is enrolled
+# Finishing the unlock: one pass, one reboot, one human step
 
-This is the only path left on this host (see `../RESULTS.md` section 6): the
-stock driver re-applies the fused speed selectors during GR initialisation, so a
-pre-driver write cannot survive. The project's driver-side patch performs the
-same privileged write from inside the driver, and the module that carries it has
-to be locally signed — which Secure Boot accepts only if its key is enrolled.
+The stock driver re-applies the fused speed selectors during GR initialisation,
+so a pre-driver write cannot survive (see `../RESULTS.md`). The project's
+driver-side patch performs the same privileged write from inside the driver and
+does survive — but its module must be locally signed, and Secure Boot only
+accepts a locally signed module once that key is enrolled.
 
-Everything that can be prepared without physical access is prepared here.
+Everything except the enrolment is automated.
 
-## Prerequisites already in place
+## What is already in place
 
 | | |
 |---|---|
-| key pair | `/var/lib/shim-signed/mok/MOK.priv` + `MOK.der`, subject `lmserver Secure Boot Module Signature key` |
-| enrolled keys | only Canonical's — `mokutil --list-enrolled` shows one `[key]` |
-| patched driver sources | `patches/cmp50hx/01-cmp50-stockflow.patch` against NVIDIA 610.43.03 |
-| build inputs | kernel headers, gcc, make, dkms, ~200 GB free |
+| patched driver | `artifacts/610.43.03-<kver>/` — already built for this kernel |
+| userland | `cache/NVIDIA-Linux-x86_64-610.43.03.run`, 461 MB, SHA-256 matches the value pinned in `install.sh` |
+| key pair | created by `tools/sign-modules.sh` at `/var/lib/cmp50hx-mok/` |
+| enrolled keys | only Canonical's — enrolment has not happened yet |
 
-## Step 1 — enrol the key (about two minutes at the machine)
-
-```sh
-sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
-# it asks for a one-time password; remember it
-sudo reboot
-```
-
-At the blue **MokManager** screen: `Enroll MOK` → `Continue` → `Yes` → type the
-password → `Reboot`.
-
-Check it took effect:
-
-```sh
-mokutil --list-enrolled | grep -c '^\[key'   # 2
-```
-
-## Step 2 — build, sign and install the patched driver
+## Step 1 — everything that can be automated (no person needed)
 
 ```sh
 sudo /home/lmserver/cmp50hx-unlock/userspace-unlock/tools/finish-mok.sh
 ```
 
-The script refuses to do anything unless two keys are enrolled, signs every
-built module with the local key, installs it into
-`/lib/modules/$(uname -r)/updates/cmp50hx/` (which takes precedence over the
-stock `kernel/` module), rebuilds the initramfs and reboots.
+It installs the 610.43.03 userland and the patched modules, signs the modules
+with the repository's MOK key, queues the certificate for enrolment, rebuilds
+the initramfs and verifies the signature state. It needs no network.
 
-If the artifacts are missing it tells you to run, once:
+## Step 2 — the one human step (about two minutes, at the machine)
 
 ```sh
-cd /home/lmserver/cmp50hx-unlock
-bash ./build.sh --card cmp50hx          # artifacts only, nothing is installed
+sudo reboot
 ```
+
+At the blue **MokManager** screen:
+
+```
+Enroll MOK -> Continue -> Yes -> <root password> -> Reboot
+```
+
+`tools/sign-modules.sh` queues the certificate with `mokutil --import
+--root-pw`, so MokManager asks for the **root password**, not a one-time one.
 
 ## Step 3 — verify
 
 ```sh
-# the driver must be the patched 610.43.03, not the stock 615
-cat /sys/module/nvidia/version
-modinfo -F signer nvidia                     # lmserver Secure Boot Module Signature key
-
-# the acceptance test from the project itself: all nine modifiers must be 0
+sudo ./finish-mok.sh --check          # module version, signer, enrolment
+cat /sys/module/nvidia/version        # 610.43.03
 cd /home/lmserver/cmp50hx-unlock/verify
-./rm_issue_rate 0 > /tmp/rm.json
-python3 verify.py /tmp/rm.json               # PASS_CMP50HX_ISSUE_RATE_AND_COUNTS
-
-# and the throughput
-cd /home/lmserver/cmp50hx-unlock/userspace-unlock
-./cmp50-fma 200000 0                         # expect well above 6.4 TFLOP/s
+./rm_issue_rate 0 > /tmp/rm.json && python3 verify.py /tmp/rm.json
+cd /home/lmserver/cmp50hx-unlock/userspace-unlock && ./cmp50-fma 200000 0
 ```
 
-## Rollback
+Success looks like `PASS_CMP50HX_ISSUE_RATE_AND_COUNTS` and a large jump in
+FP32 throughput (the locked state measures ~6.4 TFLOP/s here).
+
+## Recovery
+
+If MokManager is skipped or the patched driver does not come up, SSH still
+works and the stock module is untouched:
 
 ```sh
-sudo rm -rf /lib/modules/$(uname -r)/updates/cmp50hx
-sudo depmod -a
-sudo update-initramfs -u
+sudo /home/lmserver/cmp50hx-unlock/userspace-unlock/tools/rollback-patched.sh
 sudo reboot
 ```
 
-The stock, Canonical-signed 615 module loads again; the cards return to the
-locked state exactly as they are now.
+`rollback-patched.sh` only moves `/lib/modules/<kver>/updates/nvidia*.ko` aside;
+the Canonical-signed 615 module in `kernel/` is never touched, so the cards
+return to their current state.
 
-## Known pitfalls recorded during the investigation
+## Pitfalls found during the investigation
 
-- **Userspace version must match the module.** A 610.x kernel module needs the
-  610.x user libraries (NVML/CUDA refuse a mismatch). `nvidia-driver-610` is
-  installed but its libraries were replaced by 615 at some point — check
-  `nvidia-smi` after the first boot and, if it complains about a version
-  mismatch, install the matching userspace from the same 610.43.03 run file.
-- **The driver must actually be the patched build.** If `/sys/module/nvidia/version`
-  still reports 615, the `updates/` copy did not win; check that the `.ko` name
-  matches what `modinfo -n nvidia` resolves to.
-- **Do not let the pre-driver service run as well.** `systemctl disable
-  cmp50-unlock` — the patched driver does the unlock itself, and two writers on
-  the same block only add risk.
-- **A failed patched boot is recoverable over SSH only if the network comes up.**
-  Keep the stock module available (this rollback) before rebooting.
+- **The `.run` replaces the userland with 610.43.03.** If the patched module is
+  then removed (rollback, or a failed enrolment), the machine is left with a 615
+  kernel module and a 610.43 userland: the cards work, but `nvidia-smi` reports
+  `Driver/library version mismatch`. `finish-mok.sh` now compares the module and
+  NVML versions before letting you reboot, and the fix is to reinstall the
+  matching userland:
+
+  ```sh
+  sudo apt-get install --reinstall nvidia-utils-615 libnvidia-compute-615 \
+       libnvidia-gl-615 libnvidia-cfg1-615 libnvidia-encode-615 \
+       libnvidia-decode-615 libnvidia-extra-615 libnvidia-fbc1-615 && sudo ldconfig
+  ```
+
+- **An unsigned module in `updates/` is a boot hazard.** It shadows the signed
+  distro module *and* gets copied into the initramfs, so the next boot comes up
+  without a GPU driver. Always keep the patched modules out of
+  `/lib/modules/<kver>/updates/` until the key is enrolled; `rollback-patched.sh`
+  does that, and `--check` shows which module would load.
+- **The pre-driver service must stay off.** `systemctl disable cmp50-unlock` —
+  the patched driver performs the unlock itself.
+- **A rebuilt module needs re-signing.** After any kernel update, run
+  `tools/sign-modules.sh` again (it signs everything in `updates/`) and rebuild
+  the initramfs; an unsigned rebuild is refused at load time.
+- **Do not let DKMS shadow the module.** A DKMS-built `nvidia.ko` lands in
+  `updates/` and is signed with a key that may not be enrolled; the signed
+  distro module in `kernel/` then stops being used.
