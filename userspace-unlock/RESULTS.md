@@ -97,3 +97,38 @@ cd ../verify && ./rm_issue_rate 0 | python3 verify.py /dev/stdin   # expects all
 Watch `RATE=0x00000000` in the unlock log: that is the hardware accepting the
 override. Watch `rm_issue_rate`: that is what the working system actually uses.
 The gap between the two is the driver re-latch described above.
+
+## 6. The one remaining path: the driver-side patch with an enrolled MOK
+
+Everything that needs no console has been tried (section 3). The mechanism that
+survives is the project's own `patches/cmp50hx/01-cmp50-stockflow.patch`: it
+performs the same privileged write from inside the driver, before GSP-RM starts,
+so nothing re-applies the fuses afterwards.
+
+It needs a locally built module, which Secure Boot accepts only if the signing
+key is enrolled. On this host the key pair already exists —
+`/var/lib/shim-signed/mok/MOK.{priv,der}`, created by the DKMS install, subject
+`lmserver Secure Boot Module Signature key` — but `mokutil --list-enrolled`
+shows only Canonical's key, so modules signed with it are rejected.
+
+Enrolling it needs physical presence exactly once, for about two minutes:
+
+```sh
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der   # sets a one-time password
+sudo reboot
+# at the blue MokManager screen: Enroll MOK -> Continue -> Yes -> password -> reboot
+mokutil --list-enrolled | grep -c '^\[key'               # expect 2
+```
+
+After that, build and sign the patched module and the unlock becomes persistent:
+
+```sh
+sudo ./install.sh --card cmp50hx        # repository root: builds + installs the patched 610 set
+# the DKMS hook signs with /var/lib/shim-signed/mok/MOK.priv automatically
+```
+
+Two things to check before that run: the patch targets 610.43.03 sources, and the
+signed 610 module packages for this kernel are missing/skewed (section 3), so the
+patched build has to be produced by DKMS from the 610.57.04 source package
+(`nvidia-kernel-source-610`) rather than from `linux-modules-nvidia-610-*`.
+
