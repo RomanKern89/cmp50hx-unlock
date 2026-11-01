@@ -1,0 +1,19 @@
+# Local and generated files that must not be published
+ssh.txt
+*.log
+
+# build outputs of the patched driver
+cache/
+work/
+artifacts/
+backups/
+
+# userspace-unlock build products (the sources are tracked)
+userspace-unlock/cmp50-unlock-us
+userspace-unlock/cmp50-regs
+userspace-unlock/cmp50-fma
+userspace-unlock/cmp50-dp4a
+userspace-unlock/usplat
+userspace-unlock/*.o
+
+decompil/*.i64
