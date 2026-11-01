@@ -52,8 +52,9 @@ static char *build_ptx(void)
      * Fold every accumulator into the value that is stored. Without this the
      * fifteen chains nobody reads are dead code and ptxas deletes them: the run
      * then reports about 16x the silicon's DP4A rate (measured 812 TIOP/s for a
-     * part whose peak is ~70 TIOP/s). The seeds above stay distinct so the
-     * remaining chains cannot be merged by CSE either.
+     * part whose peak is ~54 TIOP/s: 3584 cores * 4 int8 MAC * 2 ops at 1.89
+     * GHz). The seeds above stay distinct so the remaining chains cannot be
+     * merged by CSE either.
      */
     n += snprintf(p + n, cap - n, "    mov.u32 %%r22, %%r3;\n");
     for (a = 1; a < ACC; a++)

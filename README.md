@@ -17,9 +17,10 @@ Everything here was verified on real hardware: two CMP 50HX with 20 GiB
 | Metric | Clamped (stock) | Unlocked | Gain |
 | --- | ---: | ---: | ---: |
 | FP32 FFMA | 0.40 TFLOP/s | **12.9 TFLOP/s** | **~32×** |
-| INT8 DP4A | 1.63 TIOP/s | **51.6 TIOP/s** | **~32×** |
+| INT8 DP4A | 1.63 TIOP/s | **52.0 TIOP/s** | **~32×** |
 
-`12.9 TFLOP/s` is 96% of the 13.55 TFLOP/s this part can do. The state is
+`12.9 TFLOP/s` is 96% of the 13.55 TFLOP/s this part can do, and `52.0 TIOP/s`
+is 96% of its 54.2 TIOP/s DP4A rate. The state is
 **persistent** — it survives reboots and a full power cycle — and it is confirmed
 by NVIDIA's own RM interface, not just by a benchmark:
 

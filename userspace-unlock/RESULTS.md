@@ -17,6 +17,42 @@ state and its service stays disabled: with Secure Boot off the patched driver
 does the privileged write itself, at the point in its own boot where nothing
 overwrites it.
 
+## Reinstall and re-verification (fresh Ubuntu 26.04.1, 2026-11-01)
+
+The machine was reinstalled from scratch and the unlock rebuilt from this
+repository with `sudo ./install.sh --card cmp50hx` (commit `67b13c5`). One
+CMP 50HX (20480 MiB) was present; a GT 220 drives the console.
+
+| | |
+| --- | --- |
+| OS / kernel | Ubuntu 26.04.1 LTS, `7.0.0-42-generic` |
+| firmware | Secure Boot **disabled**, `lockdown=[none]`, `sig_enforce=N` |
+| driver | patched 610.43.03 from `/lib/modules/7.0.0-42-generic/updates/`, unsigned; userland 610.43.03 |
+| RM acceptance | `v1 = [0,0,0,0,0,0,0,0,0]`, two runs of `v2` = all zeros; 3584 / 56 / 448 cores |
+| FP32 FFMA | **12.85–12.97 TFLOP/s** (peak 13.55, i.e. 95–96%) |
+| INT8 DP4A | **52.0 TIOP/s** (peak 54.2, i.e. 96%) |
+| 30 s sustained | 47–50 °C, 82–96 W, SM 1890 MHz, mem 7000 MHz, 0 Xid, throttle reasons 0 |
+| initramfs | rebuilt, module `srcversion` verified against `updates/` |
+| BAR1 | 64 MiB — the ReBAR request cannot be placed (see below) |
+| PCIe | `ADOPT_FAIL ret=0 cap=10453d01 tries=50 (locked set still in effect)` — Gen2 still closed, as documented |
+
+Two tooling defects this run exposed and fixed:
+
+* `cmp50-dp4a` reported **812 TIOP/s**, 16x above the part's peak. The kernel
+  kept 16 accumulator chains but stored only the first, so ptxas deleted the
+  other fifteen and the run charged for 16x the work it performed. Folding
+  every chain into the stored value gives 52.0 TIOP/s, stable at 20k, 200k and
+  2M iterations (0.0516 s / 0.5158 s / 5.1892 s — the runtime scales linearly,
+  so the loop is real).
+* `verify.py` exited non-zero on `CMP_SKU is 0` although all nine issue-rate
+  fields read full speed. The patched driver clears the SKU selector by design,
+  so 0 is now a note and any other value still fails.
+
+ReBAR: this board enumerates all PCI memory below 4 GiB (the root port window
+is 96 MiB and everything sits in `0xd2..0xfb`), so a 16 GiB BAR1 has nowhere to
+go and BAR1 stays 64 MiB. Enabling `Above 4G Decoding` in firmware is what the
+resize would need; the compute unlock does not depend on it.
+
 Everything below records how that conclusion was reached: what the userspace
 port proves, why it alone is not enough with the stock driver, and which paths
 were tried and closed on the way.

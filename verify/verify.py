@@ -28,7 +28,18 @@ def main():
 
     gpu = values_by_name(controls["gpu_info"])
     gr = values_by_name(controls["gr_info"])
-    expected_gpu = {"CMP_SKU": 1, "DISPLAY_ENABLED": 0}
+    # The patched driver clears the SKU selector, so on a working unlock
+    # CMP_SKU reads 0 rather than 1. The nine issue-rate values checked above
+    # are the actual unlock signal; the SKU is only a sanity check on stock
+    # firmware.
+    sku = gpu.get("CMP_SKU")
+    if sku == 0:
+        print("note: CMP_SKU reads 0 - expected on the patched driver, which "
+              "clears the SKU selector", file=sys.stderr)
+    elif sku != 1:
+        raise SystemExit(f"CMP_SKU is {sku}, expected 1 (or 0 on the patched driver)")
+
+    expected_gpu = {"DISPLAY_ENABLED": 0}
     expected_gr = {
         "GPU_CORE_COUNT": 3584,
         "RT_CORE_COUNT": 56,
