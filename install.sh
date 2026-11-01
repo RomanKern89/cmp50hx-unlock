@@ -2,7 +2,7 @@
 # CMP 50HX (10de:1e09) all-feature installer for
 # Ubuntu/Debian. The card is auto-detected; force it with --card.
 #
-#   curl -fsSL https://raw.githubusercontent.com/xrip/cmp50hx-unlock/master/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/RomanKern89/cmp50hx-unlock/master/install.sh | sudo bash
 #
 # Options:
 #   --card cmp50hx           force the card instead of auto-detecting
@@ -10,6 +10,11 @@
 #                            which drops idle power to about 2 W (see idle-governor/)
 #   --rebar-32g              ask for a 32 GiB BAR1 instead of the default 16 GiB
 #                            (selector 9; needs a host that can place the window)
+#   --gen2                   also enable cmp50hx-gen2.service. It is installed but
+#                            left disabled by default: on boards where the slot's
+#                            link policy is locked it can only loop, and a retrain
+#                            while the policy is locked has wedged the card
+#                            (userspace-unlock/BIOS-SETUP.md).
 #
 # What it does, in order:
 #   1. detects the card (or takes --card cmp50hx)
@@ -28,7 +33,10 @@
 set -Eeuo pipefail
 
 readonly driver_version="610.43.03"
-readonly repo_tarball="https://github.com/xrip/cmp50hx-unlock/archive/refs/heads/master.tar.gz"
+# The repository is re-fetched into /opt so that the installed copy is exactly
+# the tree this script belongs to. Point CMP_UNLOCK_REPO_TARBALL at another
+# fork/ref to install from there instead.
+readonly repo_tarball="${CMP_UNLOCK_REPO_TARBALL:-https://github.com/RomanKern89/cmp50hx-unlock/archive/refs/heads/master.tar.gz}"
 readonly nvidia_run_url="https://us.download.nvidia.com/XFree86/Linux-x86_64/${driver_version}/NVIDIA-Linux-x86_64-${driver_version}.run"
 # SHA-256 of the .run package above, pinned from the official download.
 readonly nvidia_run_sha256="45e2d4c134a23c35e50f253a4aa63e7e5e8d17e3d185d4a07c8a58e9612ed392"
@@ -41,6 +49,7 @@ trap 'die "install failed at line ${LINENO}; see output above"' ERR
 
 card=''
 idle_governor=0
+gen2_service=0
 rebar_selector=8
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             idle_governor=1
             shift
             ;;
+        --gen2)
+            gen2_service=1
+            shift
+            ;;
         --rebar-32g)
             rebar_selector=9
             shift
@@ -64,7 +77,7 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            die "unknown argument: $1 (supported: --card, --idle-governor, --rebar-32g)"
+            die "unknown argument: $1 (supported: --card, --idle-governor, --rebar-32g, --gen2)"
             ;;
     esac
 done
@@ -277,8 +290,16 @@ if [[ "${card}" == cmp50hx ]]; then
     install -m 0755 "${runtime_dir}/cmp50hx-gen2.sh" /usr/local/sbin/cmp50hx-gen2
     install -m 0644 "${runtime_dir}/cmp50hx-gen2.service" /etc/systemd/system/cmp50hx-gen2.service
     systemctl daemon-reload
-    systemctl enable cmp50hx-gen2.service >/dev/null
-    log "installed and enabled cmp50hx-gen2.service (the card unlocks its PCIe speed registers a few minutes after boot; the service retrains to Gen2 then; NOT started now)"
+    if [[ "${gen2_service}" -eq 1 ]]; then
+        systemctl enable cmp50hx-gen2.service >/dev/null
+        gen2_state="ENABLED (card unlocks its PCIe speed registers a few minutes after boot; the service retrains to Gen2 then; not started now)"
+        log "installed and enabled cmp50hx-gen2.service"
+    else
+        gen2_state="installed, NOT enabled (enable: --gen2, only if the slot comes up Gen2-ready)"
+        log "installed cmp50hx-gen2.service but left it disabled (see userspace-unlock/BIOS-SETUP.md)"
+    fi
+else
+    gen2_state="n/a"
 fi
 
 # --- 6c. optional idle P-state governor -------------------------------------
@@ -378,6 +399,7 @@ Repository : ${install_dir}
 Log        : ${install_dir}/logs/install-${ts}.log
 Live check : ${live_check}
 Initramfs  : ${initramfs_state}
+Gen2 svc   : ${gen2_state}
 Idle governor: ${governor_state}
 Tuning     : cmp-tune list | cmp-tune status | sudo cmp-tune apply PROFILE
 
