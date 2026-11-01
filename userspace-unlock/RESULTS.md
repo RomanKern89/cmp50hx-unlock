@@ -1,5 +1,26 @@
 # Results: userspace unlock on the two 20 GiB CMP 50HX (host .214)
 
+## Final result (Secure Boot off + patched driver)
+
+| | |
+| --- | --- |
+| firmware | Secure Boot **disabled** in setup (`OS Type = Other OS`), `lockdown=none`, `sig_enforce=N` |
+| driver | the project's patched **610.43.03**, loaded from `/lib/modules/<kver>/updates/`, userland 610.43.03 |
+| RM acceptance (`verify/rm_issue_rate`) | `v1 = [0,0,0,0,0,0,0,0,0]`, `v2 = [0,…,0]` — all nine issue-rate fields at full speed |
+| FP32 FFMA | **12.92–12.96 TFLOP/s** (96% of the 13.55 TFLOP/s the part can do) |
+| INT8 DP4A | **51.8 TIOP/s** |
+| 30 s sustained | 12.86 TFLOP/s, 55 °C, 95 W, no new Xid |
+| project reference | unlocked 13.512 TFLOP/s / 47.984 TIOP/s, stock 0.427 / 1.689 → about **30×** |
+
+The pre-driver userspace unlock (`cmp50-unlock-us`) is not used in this final
+state and its service stays disabled: with Secure Boot off the patched driver
+does the privileged write itself, at the point in its own boot where nothing
+overwrites it.
+
+Everything below records how that conclusion was reached: what the userspace
+port proves, why it alone is not enough with the stock driver, and which paths
+were tried and closed on the way.
+
 What was measured on the real hardware, what it proves, and where it stops.
 Everything below was produced on 2026-11-01 on Ubuntu 26.04 / kernel
 `7.0.0-42-generic` / Secure Boot on (`lockdown=integrity`, `sig_enforce=Y`) /

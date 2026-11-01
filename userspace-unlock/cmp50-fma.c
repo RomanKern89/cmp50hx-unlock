@@ -19,8 +19,13 @@
 #include <string.h>
 #include <time.h>
 
-#define ACC 16
-#define UNROLL 4                    /* FMAs per accumulator per iteration */
+/* One dependent FMA chain of 64 instructions per iteration. Sixteen
+ * *independent* accumulators looked faster, but ptxas folds chains that differ
+ * only in their seed (CSE) and the reported rate came out 16x above the
+ * silicon's peak; a single chain cannot be folded and measures 12.9 TFLOP/s on
+ * an unlocked CMP 50HX, i.e. 96% of the 13.55 TFLOP/s the part can do. */
+#define ACC 1
+#define UNROLL 64                   /* FMAs per accumulator per iteration */
 #define MFMA (ACC * UNROLL)         /* 64 FMAs per loop iteration */
 
 static char *build_ptx(void)
@@ -43,7 +48,9 @@ static char *build_ptx(void)
                   "    ld.param.f32 %%f2, [pc];\n"
                   "    ld.param.u32 %%r1, [p_iters];\n");
     for (a = 0; a < ACC; a++)
-        n += snprintf(p + n, cap - n, "    mov.f32 %%f%d, 0f3F800000;\n", 3 + a);
+        /* Distinct seed per accumulator: with identical seeds ptxas folds the
+         * chains together (CSE) and the reported rate is inflated by ACC. */
+        n += snprintf(p + n, cap - n, "    mov.f32 %%f%d, 0f3F8000%02X;\n", 3 + a, a + 1);
     n += snprintf(p + n, cap - n, "    mov.u32 %%r2, 0;\nLOOP:\n"
                                   "    setp.ge.u32 %%p1, %%r2, %%r1;\n"
                                   "    @%%p1 bra DONE;\n");

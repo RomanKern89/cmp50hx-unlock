@@ -38,7 +38,8 @@ static char *build_ptx(void)
                   "    ld.param.u32 %%r2, [pb];\n"
                   "    ld.param.u32 %%r20, [p_iters];\n");
     for (a = 0; a < ACC; a++)
-        n += snprintf(p + n, cap - n, "    mov.u32 %%r%d, 0;\n", 3 + a);
+        /* Distinct seeds so ptxas cannot fold the chains into one (CSE). */
+        n += snprintf(p + n, cap - n, "    mov.u32 %%r%d, 0x%08x;\n", 3 + a, a + 1);
     n += snprintf(p + n, cap - n, "    mov.u32 %%r21, 0;\nLOOP:\n"
                                   "    setp.ge.u32 %%p1, %%r21, %%r20;\n"
                                   "    @%%p1 bra DONE;\n");
