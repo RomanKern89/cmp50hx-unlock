@@ -47,10 +47,18 @@ static char *build_ptx(void)
         for (a = 0; a < ACC; a++)
             n += snprintf(p + n, cap - n,
                           "    dp4a.u32.u32 %%r%d, %%r1, %%r2, %%r%d;\n", 3 + a, 3 + a);
-    n += snprintf(p + n, cap - n, "    add.u32 %%r21, %%r21, 1;\n    bra LOOP;\nDONE:\n"
-                                  "    setp.eq.u32 %%p1, %%r3, 0x7fffffff;\n"
-                                  "    @%%p1 st.global.u32 [%%rd1], %%r3;\n"
-                                  "    ret;\n}\n");
+    n += snprintf(p + n, cap - n, "    add.u32 %%r21, %%r21, 1;\n    bra LOOP;\nDONE:\n");
+    /*
+     * Fold every accumulator into the value that is stored. Without this the
+     * fifteen chains nobody reads are dead code and ptxas deletes them: the run
+     * then reports about 16x the silicon's DP4A rate (measured 812 TIOP/s for a
+     * part whose peak is ~70 TIOP/s). The seeds above stay distinct so the
+     * remaining chains cannot be merged by CSE either.
+     */
+    n += snprintf(p + n, cap - n, "    mov.u32 %%r22, %%r3;\n");
+    for (a = 1; a < ACC; a++)
+        n += snprintf(p + n, cap - n, "    xor.b32 %%r22, %%r22, %%r%d;\n", 3 + a);
+    n += snprintf(p + n, cap - n, "    st.global.u32 [%%rd1], %%r22;\n    ret;\n}\n");
     return p;
 }
 
