@@ -79,7 +79,11 @@ if [ ! -f "$OUT" ]; then
 fi
 
 echo "=== 4. convert ==="
+# --output-target (not --target): the input is an ELF .so, and since binutils
+# 2.46 the "efi-app-x86_64" name is only an output format alias (as an input
+# format it fails with "file format not recognized"). Output target also sets
+# the PE subsystem to EFI application (10), which pei-x86-64 does not.
 objcopy -j .text -j .sdata -j .data -j .rodata -j .dynamic -j .dynsym \
     -j .reloc -j .rel -j .rela -j .rel.* -j .rela.* \
-    --target=efi-app-x86_64 "$OUT" "$EFIOUT" 2>&1 | tail -4
+    --output-target=efi-app-x86_64 "$OUT" "$EFIOUT" 2>&1 | tail -4
 ls -la "$EFIOUT" && sha256sum "$EFIOUT" && echo BUILD_OK

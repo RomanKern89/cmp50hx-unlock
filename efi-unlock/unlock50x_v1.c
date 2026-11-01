@@ -682,6 +682,23 @@ static EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *gRb = NULL;
 static UINTN gBus = 0, gDev = 0, gFn = 0;
 static UINT32 gBar0Base = 0;
 
+/* ==== Multi-GPU (v1.51): unlock every CMP 50HX, not just the first ====
+ * One card per run was the 40HX baseline; a host can hold more than one
+ * 10de:1e09 (the two-card test rig this was ported for). u50_enumerate_gpus()
+ * fills the table below before anything is touched, and u50_select_gpu()
+ * re-arms the gBus/gDev/gFn/gRb/gBar0Base globals — every later step of the
+ * exploit reads those, so the same sequence runs once per card.
+ * u50_gpuRb is NULL for cards found through raw CF8 (enc=2): that config
+ * space access is global and never goes through RootBridgeIo, and the bridge
+ * pointer only matters for the enc=0/1 fallback. */
+#define U50_MAX_GPUS 8
+static UINTN u50_gpuBus[U50_MAX_GPUS];
+static UINTN u50_gpuDev[U50_MAX_GPUS];
+static UINTN u50_gpuFn[U50_MAX_GPUS];
+static INTN  u50_gpuEnc[U50_MAX_GPUS];
+static EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *u50_gpuRb[U50_MAX_GPUS];
+static UINTN u50_gpuCount = 0;
+
 /* v1.50: WPR2 state captured before the GFW engine reset (step [7.6]),
  * used by step [8b] to decide whether the manual FWSEC boot is needed. */
 static EFI_HANDLE g_IH = NULL;   /* real image handle under the crt0 entry */
@@ -4142,7 +4159,197 @@ static int u40x_find_gpu_pass(INTN enc)
     return 0;
 }
 
-static int u40x_find_gpu(void)
+/* ---- multi-GPU enumeration (v1.51) ------------------------------------
+ * The single-card finder above stops at the first hit. On a host with two
+ * CMP 50HX that leaves the second card locked, so the release path uses the
+ * three helpers below instead: u50_scan_pass() collects every match for one
+ * config-space encoding, u50_enumerate_gpus() walks the encodings in the
+ * same order the single-card path did (CF8 first, RootBridgeIo as the
+ * fallback), and u50_select_gpu() re-arms the per-card globals. */
+
+/* Record one card. Returns 1 when it is new, 0 for a duplicate (the same
+ * BDF can be reported by more than one encoding/bridge pass) or when the
+ * table is full. */
+static UINTN
+u50_add_gpu(UINTN bus, UINTN dev, UINTN fn, INTN enc,
+            EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *rb)
+{
+    UINTN k;
+
+    for (k = 0; k < u50_gpuCount; k++) {
+        if (u50_gpuBus[k] == bus && u50_gpuDev[k] == dev &&
+            u50_gpuFn[k] == fn && u50_gpuRb[k] == rb)
+            return 0;
+    }
+    if (u50_gpuCount >= U50_MAX_GPUS) {
+        Print(L"[50HX f] more than %d cards — ignoring the rest\n",
+              (INTN)U50_MAX_GPUS);
+        return 0;
+    }
+    u50_gpuBus[u50_gpuCount] = bus;
+    u50_gpuDev[u50_gpuCount] = dev;
+    u50_gpuFn[u50_gpuCount]  = fn;
+    u50_gpuEnc[u50_gpuCount] = enc;
+    u50_gpuRb[u50_gpuCount]  = rb;
+    u50_gpuCount++;
+    Print(L"[50HX f] card #%d at %02x:%02x.%x (enc=%d)\n",
+          (INTN)u50_gpuCount, (INTN)bus, (INTN)dev, (INTN)fn, (INTN)enc);
+    return 1;
+}
+
+/* Collect every 10de:1e09 reachable with one encoding. Same probe order as
+ * the legacy single-card finder (fast list, then a bounded bus sweep; CF8
+ * covers bus 0..255), but it never stops early. Returns the number of new
+ * cards added. */
+static UINTN
+u50_scan_pass(INTN enc, EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *rb)
+{
+    static const UINT8 fastL[][3] = {
+        {2, 0, 0}, {1, 0, 0}, {3, 0, 0},
+        {0, 0, 0}, {4, 0, 0}, {5, 0, 0}
+    };
+    UINTN k, b, d, f, added = 0;
+    const UINTN maxBus = (enc == 2) ? 256u : 17u;
+
+    /* enc=2 is raw CF8/CFC and ignores gRb; enc=0/1 read config space
+     * through the root bridge that owns the bus segment. */
+    if (enc != 2)
+        gRb = rb;
+
+    for (k = 0; k < sizeof(fastL) / sizeof(fastL[0]); k++) {
+        UINT32 id = u40x_pci_rbdf(fastL[k][0], fastL[k][1], fastL[k][2], 0, enc);
+        if (id == 0xFFFFFFFFu)
+            continue;
+        if ((id & 0xFFFFu) == 0x10DEu &&
+            ((id >> 16) & 0xFFFFu) == 0x1E09u)
+            added += u50_add_gpu(fastL[k][0], fastL[k][1], fastL[k][2], enc, rb);
+    }
+    for (b = 0; b < maxBus; b++) {
+        for (d = 0; d < 32; d++) {
+            UINT32 id0 = u40x_pci_rbdf(b, d, 0, 0, enc);
+            UINTN maxf = 1;
+            UINT32 hdr;
+            if (id0 == 0xFFFFFFFFu || (id0 & 0xFFFFu) == 0u)
+                continue;                       /* 空槽先skip，不再多读 hdr */
+            hdr = u40x_pci_rbdf(b, d, 0, 0x0C, enc);
+            if (hdr & 0x800000u)    /* multifunction: HT bit7 = dword bit23 */
+                maxf = 8;
+            for (f = 0; f < maxf; f++) {
+                UINT32 id = (f == 0) ? id0 : u40x_pci_rbdf(b, d, f, 0, enc);
+                if (id == 0xFFFFFFFFu)
+                    continue;
+                if ((id & 0xFFFFu) == 0x10DEu &&
+                    ((id >> 16) & 0xFFFFu) == 0x1E09u)
+                    added += u50_add_gpu(b, d, f, enc, rb);
+            }
+        }
+    }
+    return added;
+}
+
+/* Fill the u50_gpu* table with every CMP 50HX the firmware lets us see.
+ * Returns 1 when at least one card was found. */
+static int
+u50_enumerate_gpus(void)
+{
+    EFI_HANDLE *H = NULL;
+    UINTN N = 0, i;
+    EFI_STATUS st;
+
+    u50_gpuCount = 0;
+    g_ryzenApu = u40x_is_ryzen_apu();
+    if (g_ryzenApu)
+        Print(L"[50HX f] Ryzen APU detected (AMD iGPU on bus 0) — "
+              L"skipping enc=0,1 (AGESA RootBridgeIo unsafe)\n");
+
+    st = uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol,
+            &gEfiPciRootBridgeIoProtocolGuid, NULL, &N, &H);
+    if (EFI_ERROR(st)) {
+        Print(L"[50HX f] RB LocateHandleBuffer: %r\n", st);
+        N = 0;      /* 拿不到 RB handle也continue走 CF8 直读兜底 */
+        H = NULL;
+    } else {
+        Print(L"[50HX f] %d root bridge(s)\n", (INTN)N);
+    }
+
+    /* issue #25: CF8 (enc=2) FIRST. enc=2 uses raw CPU CF8/CFC port I/O,
+     * never goes through RootBridgeIo->Pci.Read, and covers bus 0..255
+     * globally — so it does not depend on a working per-bridge enumeration.
+     * On Intel X99 / X299 firmware the RootBridgeIo Pci.Read path can hang
+     * mid-scan. enc=0/1 stays as a fallback for the rare firmware where
+     * CF8 cannot reach the card but a working RootBridgeIo can. On AGESA /
+     * AMD Ryzen APU hosts (g_ryzenApu == TRUE) RootBridgeIo is unsafe too
+     * (issue #24 stack corruption), so the fallback is skipped there. */
+    u50_scan_pass(2, NULL);
+
+    if (u50_gpuCount == 0) {
+        if (g_ryzenApu) {
+            Print(L"[50HX f] CF8 didn't find the card on Ryzen APU host; "
+                  L"RootBridgeIo is unsafe, aborting\n");
+        } else {
+            for (i = 0; i < N; i++) {
+                EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *rb = NULL;
+                st = uefi_call_wrapper(BS->HandleProtocol, 3, H[i],
+                        &gEfiPciRootBridgeIoProtocolGuid, (VOID **)&rb);
+                if (EFI_ERROR(st) || !rb)
+                    continue;
+                gRb = rb;
+                u50_scan_pass(0, rb);
+                u50_scan_pass(1, rb);
+            }
+        }
+    }
+    if (H)
+        uefi_call_wrapper(BS->FreePool, 1, H);
+
+    if (u50_gpuCount)
+        return 1;
+
+    /* 全failed：CF8 只读扫一遍，把可见devicemapping写进 50hx_log.txt（≤96 条），
+     * 下次定bit“卡到底在不在 PCI 上 / 在哪个 BDF”一目了然。 */
+    {
+        UINTN b2, d2, f2, cnt = 0;
+        Print(L"[50HX f] diag: CF8 visible devices (VEN:DEV @ BDF):\n");
+        for (b2 = 0; b2 < 256; b2++) {
+            for (d2 = 0; d2 < 32; d2++) {
+                for (f2 = 0; f2 < 8; f2++) {
+                    UINT32 id = u40x_pci_rbdf(b2, d2, f2, 0, 2);
+                    if (id == 0xFFFFFFFFu || (id & 0xFFFFu) == 0u)
+                        continue;
+                    Print(L"%02x:%02x.%x  %04x:%04x\n",
+                          (UINT32)b2, (UINT32)d2, (UINT32)f2,
+                          (UINT32)(id & 0xFFFFu),
+                          (UINT32)((id >> 16) & 0xFFFFu));
+                    if (++cnt >= 96)
+                        goto diag_done;
+                }
+            }
+        }
+diag_done: ;
+    }
+    Print(L"[50HX f] 40HX/90HX not found (both encodings)\n");
+    return 0;
+}
+
+/* Point the per-card globals at card idx. Returns 0 on a bad index. */
+static int
+u50_select_gpu(UINTN idx)
+{
+    if (idx >= u50_gpuCount)
+        return 0;
+    gBus = u50_gpuBus[idx];
+    gDev = u50_gpuDev[idx];
+    gFn  = u50_gpuFn[idx];
+    gRb  = u50_gpuRb[idx];
+    u40x_enc_found = u50_gpuEnc[idx];
+    gBar0Base = 0;
+    return 1;
+}
+
+/* Legacy single-card finder (stops at the first 10de:1e09). Superseded by
+ * u50_enumerate_gpus(); kept for reference until the multi-card path is
+ * proven on hardware. */
+static int u40x_find_gpu_legacy(void)
 {
     EFI_HANDLE *H = NULL;
     UINTN N = 0, i;
@@ -4486,12 +4693,18 @@ u40x_rebar_try(UINT64 want, UINT32 selector)
           (INT32)(want >> 30), cand, b1base);
 }
 
-/* ===== v55 主entry（DIRECT_SEC2，40HX） ===== */
-EFI_STATUS
-efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+/* ===== v55 per-card unlock (DIRECT_SEC2, 40HX) =====
+ * One full unlock pass for the card u50_select_gpu() selected. Everything the
+ * exploit reads per card is a global (BDF, root bridge, BAR0 base, SKU
+ * geometry, WPR2 snapshot), so instead of duplicating the sequence the
+ * caller re-arms those globals and calls this once per card. The prologue
+ * that used to live in efi_main (InitializeLib, ESP log, loader preload) now
+ * runs once in efi_main, before the first card is touched. */
+static EFI_STATUS
+u50_unlock_card(EFI_HANDLE ImageHandle)
 {
     EFI_STATUS Status = EFI_SUCCESS;
-    BOOLEAN returnToGrub;
+    BOOLEAN unlocked = FALSE;
     UINT64 v67Phys = 0, v67LowPhys = 0;
     UINT64 ucodePhys = 0, blPhys = 0;
     UINT64 radixPhys = 0, radixTabPhys = 0, radixSize = 0;
@@ -4501,47 +4714,23 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     UINT32 boot0 = 0;
     UINTN i;
 
-    InitializeLib(ImageHandle, SystemTable);
-    /* v1.50 (Linux build): with the stock crt0 entry the u40x_entry wrapper
-     * never runs, so open the ESP log here instead (same effect: all later
-     * Print output lands in \50hx_log.txt on our boot device). The gnu-efi
-     * ImageHandle global is also unset under crt0 (u40x_entry used to set
-     * it), so record the real handle for the VBIOS dumper as well. */
-    g_IH = ImageHandle;
-    /* issue #36: capture our loaded binary size for the chainload
-     * self-detection fallback. The Windows installer deploys our
-     * binary to two paths (\EFI\50HX\50HXUNLK.EFI + \EFI\Boot\bootx64.efi);
-     * a path-only "is this me" check misses the second copy and lets
-     * the chainload load it (which restarts the EFI = loop). */
-    {
-        EFI_LOADED_IMAGE *li0 = NULL;
-        if (!uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle,
-                &LoadedImageProtocol, (VOID**)&li0) && li0)
-            g_ourImageSize = (UINTN)li0->ImageSize;
-    }
-    u40x_open_log(ImageHandle);
-    Print(L"\n=== CMP50HX Unlock v1-50HX (TU102 GSP WITH_LOADER) ===\n");
-    returnToGrub = u40x_has_load_option(ImageHandle, L"--return-to-grub");
-    if (returnToGrub)
-        Print(L"[50HX] GRUB handoff mode: internal chainload disabled\n");
-    else
-        /* Read the OS loader into RAM BEFORE the unlock: the SFS fallback in
-         * chainload_preloaded() hangs on some AMI firmwares, so this is the
-         * path that must succeed. The call was lost when the 90HX branch was
-         * dropped (fffb5b9), which left every boot on the hangy fallback. */
-        preload_os_loader(ImageHandle);
-
-    /* ---------- [1] 找卡（黑盒 fast-probe + 有界） ---------- */
-    if (!u40x_find_gpu()) {
-        Print(L"[50HX] GPU not found; abort\n");
-        return returnToGrub ? EFI_SUCCESS : EFI_NOT_FOUND;
-    }
+    /* detect_fb_size() only lowers the 10 GiB defaults once it spots a
+     * 20 GiB WPR2 latch, so a 10 GiB card that follows a 20 GiB one must
+     * start from the defaults again. Same for the pre-kill WPR2 snapshot of
+     * step [7.6]. */
+    g_fbSize        = 0x280000000ULL;
+    g_frtsOffset    = FW50_FRTS_OFFSET;
+    g_wpr2LoUp      = FW50_WPR2_LO_UP;
+    g_wpr2HiUp      = FW50_WPR2_HI_UP;
+    g_Wpr2LoPreKill = 0;
+    g_Wpr2HiPreKill = 0;
 
     /* ---------- [2] BAR0 enable ---------- */
     if (u40x_enable_bar()) {
         Print(L"[50HX] BAR enable failed; abort\n");
-        return returnToGrub ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+        return EFI_DEVICE_ERROR;
     }
+
     /* Detect the card SKU from the WPR2 the VBIOS POST latched (10 GiB vs 20 GiB).
      * Must happen before any code path that consumes g_fbSize / g_frtsOffset
      * (build_wpr_meta below, fwsec_boot_gsp_50hx in step [8b]). Cold POST with
@@ -4563,10 +4752,12 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     /* ---------- [4] 快捷path：unlock / 直写可粘 ---------- */
     if (is_unlocked()) {
         Print(L"[50HX] already unlocked (SS0/SS1 exact) — skip injection\n");
+        unlocked = TRUE;
         goto done;
     }
     if (direct_write_probe()) {
         Print(L"[50HX] direct MMIO probe succeeded — skip booter\n");
+        unlocked = TRUE;
         goto done;
     }
 
@@ -4739,7 +4930,8 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         UINT32 ss0 = mmio_read32(REG_FEAT_OVR_SM_SPD);
         UINT32 ss1 = mmio_read32(REG_FEAT_OVR_SM_SPD_1);
         Print(L"[50HX] RESULT: PLM=0x%08x SS0=0x%08x SS1=0x%08x\n", plm, ss0, ss1);
-        if (is_unlocked())
+        unlocked = is_unlocked() ? TRUE : FALSE;
+        if (unlocked)
             Print(L"[50HX] *** UNLOCKED (SS0=0x88888888 SS1=0x8) ***\n");
         else if (plm == VAL_PLM_OPEN || plm == 0xFFFFFF8Fu)
             Print(L"[50HX] PLM %s — SS0 still gated\n",
@@ -4801,6 +4993,79 @@ done:
     } else {
         u40x_rebar_try(0x400000000ULL, 8U);
     }
+    /* Per-card verdict for the caller: EFI_SUCCESS also covers the two
+     * short paths above ([4] already-unlocked / direct probe), where no
+     * booter had to run. */
+    return unlocked ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+}
+
+/* ===== v55 main entry (DIRECT_SEC2, 40HX) =====
+ * Boot-time prologue once, one unlock pass per CMP 50HX, then a single
+ * chainload: the OS loader must start only after the last card is done, so
+ * the internal chainload moved out of the per-card path (it used to run at
+ * the end of the only card this program handled). */
+EFI_STATUS
+efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+{
+    BOOLEAN returnToGrub;
+    UINTN k, ok = 0, failed = 0;
+    EFI_STATUS st;
+
+    InitializeLib(ImageHandle, SystemTable);
+    /* v1.50 (Linux build): with the stock crt0 entry the u40x_entry wrapper
+     * never runs, so open the ESP log here instead (same effect: all later
+     * Print output lands in \50hx_log.txt on our boot device). The gnu-efi
+     * ImageHandle global is also unset under crt0 (u40x_entry used to set
+     * it), so record the real handle for the VBIOS dumper as well. */
+    g_IH = ImageHandle;
+    /* issue #36: capture our loaded binary size for the chainload
+     * self-detection fallback. The Windows installer deploys our
+     * binary to two paths (\EFI\50HX\50HXUNLK.EFI + \EFI\Boot\bootx64.efi);
+     * a path-only "is this me" check misses the second copy and lets
+     * the chainload load it (which restarts the EFI = loop). */
+    {
+        EFI_LOADED_IMAGE *li0 = NULL;
+        if (!uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle,
+                &LoadedImageProtocol, (VOID**)&li0) && li0)
+            g_ourImageSize = (UINTN)li0->ImageSize;
+    }
+    u40x_open_log(ImageHandle);
+    Print(L"\n=== CMP50HX Unlock v1-50HX (TU102 GSP WITH_LOADER) ===\n");
+    returnToGrub = u40x_has_load_option(ImageHandle, L"--return-to-grub");
+    if (returnToGrub)
+        Print(L"[50HX] GRUB handoff mode: internal chainload disabled\n");
+    else
+        /* Read the OS loader into RAM BEFORE the unlock: the SFS fallback in
+         * chainload_preloaded() hangs on some AMI firmwares, so this is the
+         * path that must succeed. The call was lost when the 90HX branch was
+         * dropped (fffb5b9), which left every boot on the hangy fallback. */
+        preload_os_loader(ImageHandle);
+
+    /* ---------- [1] every CMP 50HX on this host ---------- */
+    if (!u50_enumerate_gpus()) {
+        Print(L"[50HX] GPU not found; abort\n");
+        return returnToGrub ? EFI_SUCCESS : EFI_NOT_FOUND;
+    }
+    Print(L"[50HX] %d CMP 50HX card(s) found\n", (INTN)u50_gpuCount);
+
+    for (k = 0; k < u50_gpuCount; k++) {
+        if (!u50_select_gpu(k))
+            continue;
+        Print(L"\n[50HX] ===== card %d/%d at %02x:%02x.%x =====\n",
+              (INTN)(k + 1), (INTN)u50_gpuCount,
+              (INTN)gBus, (INTN)gDev, (INTN)gFn);
+        st = u50_unlock_card(ImageHandle);
+        if (EFI_ERROR(st)) {
+            failed++;
+            Print(L"[50HX] card %d/%d NOT unlocked: %r\n",
+                  (INTN)(k + 1), (INTN)u50_gpuCount, st);
+        } else {
+            ok++;
+        }
+    }
+    Print(L"[50HX] SUMMARY: %d of %d card(s) unlocked, %d failed\n",
+          (INTN)ok, (INTN)u50_gpuCount, (INTN)failed);
+
     /* v71fix: 黑屏很久+driver掉根因 = return firmware → BDS 重跑 POST →
      * GPU 重新initialize/unlock 丢失。改用黑盒式链载（chainload_preloaded：
      * preload loader → LoadImage → StartImage，мимо — возврат в BDS），
