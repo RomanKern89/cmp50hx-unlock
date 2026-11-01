@@ -1,0 +1,27 @@
+[Unit]
+Description=CMP 50HX pre-driver speed unlock
+# nvidia is blacklisted at boot (/etc/modprobe.d/zz-cmp50-unlock.conf plus
+# rd.driver.blacklist= on the kernel command line), so the cards are still in
+# their power-on state when this runs. The driver is loaded at the very end.
+After=systemd-udev-settle.service local-fs.target
+Before=multi-user.target
+ConditionPathExists=/usr/bin/cmp50-unlock-us
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+Environment=CMP50_FB=auto
+EnvironmentFile=-/etc/default/cmp50-unlock
+# --no-flr: the booter already leaves WPR2 disabled, which is what the next
+#           driver expects, and an FLR drops the fuse-override latches.
+# --handoff nvidia: bind the driver as the last step.
+ExecStart=/usr/bin/cmp50-unlock-us --blobs /lib/firmware/cmp50hx --fb ${CMP50_FB} --no-flr --handoff nvidia
+# The rest of the driver stack is blacklisted too; load it now that the cards
+# are unlocked so CUDA/OpenCL and DRM behave as on a normal boot.
+ExecStartPost=-/sbin/modprobe -a nvidia_uvm nvidia_drm nvidia_modeset
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

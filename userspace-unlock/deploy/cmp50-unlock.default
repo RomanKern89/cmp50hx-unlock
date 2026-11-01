@@ -1,0 +1,6 @@
+# Defaults for cmp50-unlock.service (/etc/default/cmp50-unlock).
+
+# Framebuffer size used for the WPR layout. "auto" reads the FB-range register,
+# which still reports the stock 10 GiB on memory-modified cards, so a 20 GiB
+# CMP 50HX needs "20g". Check with: nvidia-smi --query-gpu=memory.total
+CMP50_FB=20g
