@@ -1923,6 +1923,15 @@ counter data in stock profiler tools before we can call the driver path working.
 The existing private-library path below remains the proven route for its named
 tool versions.
 
+### GSP booter mailbox with high system-memory addresses
+
+Before Booter Load, mailbox1 is preloaded with the high 32 bits of the
+system-memory data address. If the signed tail leaves it unchanged and the
+buffer lies above 4 GiB, mailbox1 is non-zero and the exact-state check failed
+with `SIGNED_EXACT_STATE_MISMATCH`. Patch `09-cmp50-mailbox-high-address.patch`
+(upstream #74) also accepts that preloaded value; every WPR/FECS/RESET/speed
+check in the same condition still applies.
+
 ### CUPTI and Nsight user-space unlocks
 
 CUDA 12.0.146 `libcupti.so.12` creates a per-device state and asks the private

@@ -102,21 +102,44 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 Two independent checks. The first is NVIDIA's own view, the second is measured
 throughput.
 
+Run the checks on every CMP 50HX. `CUDA_DEVICE_ORDER=PCI_BUS_ID` makes CUDA
+device numbers match the `nvidia-smi` indices.
+
 ```sh
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+CARDS=$(nvidia-smi --query-gpu=index,name --format=csv,noheader | awk -F', ' '/CMP 50HX/{print $1}')
+
 cd verify
-./rm_issue_rate 0 > /tmp/rm.json && python3 verify.py /tmp/rm.json
-# PASS_CMP50HX_ISSUE_RATE_AND_COUNTS
+cc -O2 -std=c11 rm_issue_rate.c -o rm_issue_rate
+for g in $CARDS; do
+    ./rm_issue_rate $g > /tmp/rm$g.json && python3 verify.py /tmp/rm$g.json
+done
+# PASS_CMP50HX_ISSUE_RATE_AND_COUNTS   (once per card)
 ```
 
-`verify.py` also asserts the CMP SKU and the core counts; on a patched driver
-the SKU may read 0 by design, in which case only that last assertion fails while
-the nine issue-rate values are already verified above it.
+On the patched driver `CMP_SKU` reads 0 by design; `verify.py` notes it and
+passes.
 
 ```sh
 cd ../userspace-unlock
 make
-./cmp50-fma 20000 0        # ~12.9 TFLOP/s FP32 (clamped: ~0.4)
-./cmp50-dp4a 20000 0       # ~51   TIOP/s  INT8 (clamped: ~1.6)
+for g in $CARDS; do
+    ./cmp50-fma 200000 $g    # ~12.9 TFLOP/s FP32   (clamped: ~0.4)
+    ./cmp50-dp4a 200000 $g   # ~52-54 TIOP/s INT8, clock-dependent (clamped: ~1.6)
+done
+```
+
+Optional CUDA probes (tensor cores, host link). CUDA 12.8's `nvcc` rejects
+gcc 15, the Ubuntu 26.04 default; install gcc 13 (`sudo apt install g++-13`):
+
+```sh
+cd ../verify
+nvcc -O2 -ccbin g++-13 -arch=sm_75 hgemm-bench.cu -lcublas -o hgemm-bench
+nvcc -O2 -ccbin g++-13 -arch=sm_75 pcie-bench.cu -o pcie-bench
+for g in $CARDS; do
+    ./hgemm-bench $g                          # FP16 tensor cores, device memory
+    CUDA_VISIBLE_DEVICES=$g ./pcie-bench      # Gen1 x16: H2D ~3.4 GB/s
+done
 ```
 
 The raw register view, if you want it without the driver:

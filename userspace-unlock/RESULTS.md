@@ -53,6 +53,22 @@ is 96 MiB and everything sits in `0xd2..0xfb`), so a 16 GiB BAR1 has nowhere to
 go and BAR1 stays 64 MiB. Enabling `Above 4G Decoding` in firmware is what the
 resize would need; the compute unlock does not depend on it.
 
+## Re-verification on both cards (2026-11-05)
+
+The run above had one card installed. With two cards, every check was repeated
+per card on the same driver build (loaded module `srcversion` matches the module
+built by `install.sh`, patch set before #74). Power limit 160 W (default 225 W).
+
+| | GPU 0 | GPU 1 |
+| --- | ---: | ---: |
+| RM acceptance (`rm_issue_rate` + `verify.py`) | PASS | PASS |
+| FP32 FFMA | **12.92 TFLOP/s** | **12.84 TFLOP/s** |
+| INT8 DP4A | **54.48 TIOP/s** | **54.33 TIOP/s** |
+| FP16 tensor cores, FP32 / FP16 accumulate (`verify/hgemm-bench.cu`) | 51.6 / 50.5 TFLOP/s | 50.0 / 48.5 TFLOP/s |
+| same at the default 225 W limit | 76.4 / 80.6 TFLOP/s | 75.1 / 79.4 TFLOP/s |
+| device memory (D2D copy, read + write) | 499 GB/s | 499 GB/s |
+| Xid | 0 | 0 |
+
 Everything below records how that conclusion was reached: what the userspace
 port proves, why it alone is not enough with the stock driver, and which paths
 were tried and closed on the way.
