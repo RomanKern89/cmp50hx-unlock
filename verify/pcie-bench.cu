@@ -1,6 +1,8 @@
 // Host<->device transfer bandwidth probe for the CMP 50HX Gen2 unlock.
 // Pinned-memory bidirectional copies: the number that doubles when the
 // link retrains from Gen1 x4 (~0.8 GB/s) to Gen2 x4 (~1.6 GB/s).
+// Gen1 x16: ~3.4 GB/s H2D.
+//   nvcc -O2 -ccbin g++-13 -arch=sm_75 pcie-bench.cu -o pcie-bench
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
