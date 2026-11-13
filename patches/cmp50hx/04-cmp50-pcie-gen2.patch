@@ -13,7 +13,7 @@ index b771a00..1a2b3c4 100644
  
  #include <sound/core.h>             /* HDA struct snd_card */
  
-@@ -1362,6 +1366,295 @@
+@@ -1362,6 +1366,319 @@
  #endif
  }
  
@@ -29,6 +29,11 @@ index b771a00..1a2b3c4 100644
 +module_param(cmp50_gen2_adopt, uint, 0444);
 +MODULE_PARM_DESC(cmp50_gen2_adopt,
 +    "CMP 50HX: adopt the Gen2 capability from the driver (0=leave it to the boot service)");
++
++static unsigned int cmp50_target_gen = 3;
++module_param(cmp50_target_gen, uint, 0444);
++MODULE_PARM_DESC(cmp50_target_gen,
++    "CMP 50HX: highest PCIe generation to request (2=Gen2, 3=Gen3); the card is retrained only up to the generation it actually adopts, so this is a ceiling, not a force");
 +
 +static NvBool
 +nv_cmp50hx_is_supported(struct pci_dev *gpu)
@@ -110,6 +115,13 @@ index b771a00..1a2b3c4 100644
 +    int attempt;
 +    int gate_try;
 +    int adopt_try;
++    unsigned int gen_sel;
++    unsigned int adopted_gen;
++    unsigned int target_gen;
++    u32 cfg_val;
++    u32 pl_val;
++    u16 tls_target;
++    u16 cls_target;
 +
 +    if (!nv_cmp50hx_is_supported(gpu))
 +        return;
@@ -167,6 +179,14 @@ index b771a00..1a2b3c4 100644
 +     * userspace 2026-09-13). XP3G_VALUE3/OVERRIDE3 from the RM policy are
 +     * omitted; an A/B cold boot proved the unlock does not depend on them.
 +     */
++    gen_sel = cmp50_target_gen;
++    if (gen_sel < 2U)
++        gen_sel = 2U;
++    if (gen_sel > 3U)
++        gen_sel = 3U;
++    cfg_val = gen_sel << 18;
++    pl_val = gen_sel << 17;
++
 +    nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0, "before_policy");
 +
 +    /*
@@ -192,9 +212,9 @@ index b771a00..1a2b3c4 100644
 +        cya0 = readl(bar0 + 0x8c2c0);
 +        writel(cya0 & ~(1U << 2), bar0 + 0x8c2c0);
 +        link_config = readl(bar0 + 0x8c040);
-+        writel((link_config & ~0x000C0000U) | (2U << 18), bar0 + 0x8c040);
++        writel((link_config & ~0x000C0000U) | cfg_val, bar0 + 0x8c040);
 +        pl_link_rate = readl(bar0 + 0x8c1c0);
-+        writel((pl_link_rate & ~0x00060000U) | 0x00040000U, bar0 + 0x8c1c0);
++        writel((pl_link_rate & ~0x00060000U) | pl_val, bar0 + 0x8c1c0);
 +
 +        policy_ok =
 +            (readl(bar0 + 0x8e110) == 1U) &&
@@ -203,8 +223,8 @@ index b771a00..1a2b3c4 100644
 +                ((1U << 11) | (1U << 13))) &&
 +            ((readl(bar0 + 0x88610) & ((1U << 12) | 1U)) == 1U) &&
 +            ((readl(bar0 + 0x8c2c0) & (1U << 2)) == 0U) &&
-+            (((readl(bar0 + 0x8c040) >> 18) & 3U) == 2U) &&
-+            ((readl(bar0 + 0x8c1c0) & 0x00060000U) == 0x00040000U);
++            (((readl(bar0 + 0x8c040) >> 18) & 3U) == gen_sel) &&
++            ((readl(bar0 + 0x8c1c0) & 0x00060000U) == pl_val);
 +
 +        if (policy_ok)
 +        {
@@ -240,9 +260,16 @@ index b771a00..1a2b3c4 100644
 +        iounmap(bar0);
 +        return;
 +    }
++    adopted_gen = gpu_cap & PCI_EXP_LNKCAP_SLS;
++    target_gen = (adopted_gen < gen_sel) ? adopted_gen : gen_sel;
++    tls_target = (target_gen >= 3U) ? PCI_EXP_LNKCTL2_TLS_8_0GT
++                                    : PCI_EXP_LNKCTL2_TLS_5_0GT;
++    cls_target = (target_gen >= 3U) ? PCI_EXP_LNKSTA_CLS_8_0GB
++                                    : PCI_EXP_LNKSTA_CLS_5_0GB;
 +    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
-+                  "CMP50_GEN2: ADOPT_PASS mode=normal cap=%08x tries=%d\n",
-+                  gpu_cap, adopt_try);
++                  "CMP50_GEN2: ADOPT_PASS target=Gen%u adopted=Gen%u "
++                  "cap=%08x tries=%d\n",
++                  target_gen, adopted_gen, gpu_cap, adopt_try);
 +
 +    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
 +    if (ret)
@@ -252,10 +279,8 @@ index b771a00..1a2b3c4 100644
 +    if (ret)
 +        goto capability_error;
 +
-+    gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) |
-+               PCI_EXP_LNKCTL2_TLS_5_0GT;
-+    upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) |
-+                    PCI_EXP_LNKCTL2_TLS_5_0GT;
++    gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | tls_target;
++    upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | tls_target;
 +    ret = pcie_capability_write_word(gpu, PCI_EXP_LNKCTL2, gpu_ctl2);
 +    if (ret)
 +        goto capability_error;
@@ -278,15 +303,14 @@ index b771a00..1a2b3c4 100644
 +        msleep(100);
 +        ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &link_status);
 +        if (!ret &&
-+            ((link_status & PCI_EXP_LNKSTA_CLS) >=
-+             PCI_EXP_LNKSTA_CLS_5_0GB))
++            ((link_status & PCI_EXP_LNKSTA_CLS) >= cls_target))
 +        {
 +            nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0,
 +                                      "retrain_pass_normal");
 +            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
-+                          "CMP50_GEN2: RETRAIN_PASS mode=normal "
++                          "CMP50_GEN2: RETRAIN_PASS target=Gen%u "
 +                          "status=%04x attempt=%d\n",
-+                          link_status, attempt + 1);
++                          target_gen, link_status, attempt + 1);
 +            iounmap(bar0);
 +            return;
 +        }
@@ -309,7 +333,7 @@ index b771a00..1a2b3c4 100644
  /*
   * Brings up the device on the first file open. Assumes nvl->ldata_lock is held.
   */
-@@ -1521,6 +1814,8 @@
+@@ -1521,6 +1838,8 @@
          goto failed_release_irq;
      }
  

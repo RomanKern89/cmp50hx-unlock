@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# CMP 50HX PCIe Gen2 unlock + auto-retrain (deterministic policy method).
+# CMP 50HX PCIe unlock + auto-retrain (deterministic policy method).
+#
+# Targets Gen3 (8 GT/s) by default and auto-falls-back to the highest
+# generation the card actually adopts: the policy requests the generation in
+# CMP50_TARGET_GEN (default 3, clamped to 2..3), but the outer loop only ever
+# retrains the upstream port to what the card advertises in its own target
+# (gpu_tls). So if the card accepts the Gen3 policy it trains to Gen3, and if
+# it only latches Gen2 we correctly retrain to Gen2 -- never above what the
+# card advertises. That advertised-only ladder is the anti-brick guarantee.
 #
 # The card's PCIe target-speed registers are GSP-clobbered ~100 ms after the
 # driver's boot-window policy runs, so waiting for a "self-unlock" is
@@ -23,16 +31,28 @@ TIMEOUT_MIN=20      # give up after this many minutes
 POLL_SEC=15         # how often to retry (gate opens ~5 s after boot)
 RETRAIN_WAIT_SEC=3  # how long to wait for the link to come back up
 
+# Generation the policy requests. Default Gen3; clamp to the 2..3 range the
+# 2-bit CFG0/PL_RATE fields can encode. The card still only trains as high as
+# it advertises (see gpu_tls / the header's anti-brick note).
+TARGET_GEN=${CMP50_TARGET_GEN:-3}
+if ! [[ "${TARGET_GEN}" =~ ^[0-9]+$ ]] || (( TARGET_GEN < 2 )); then
+    TARGET_GEN=2
+elif (( TARGET_GEN > 3 )); then
+    TARGET_GEN=3
+fi
+
 log() { echo "cmp50hx-gen2: $*"; }
 
-# Applies the Gen2 policy + LTSSM kick via BAR0. Prints one of:
+# Applies the unlock policy + LTSSM kick via BAR0 for the requested
+# generation. Prints one of:
 #   GATE_CLOSED          PLM gate not open yet (driver still booting)
 #   ADOPTED tls=N cap=N  policy applied, card adopted the unlocked set
 #   ALREADY tls=N cap=N  card already unlocked (CAP >= 2)
-apply_policy() { # $1 = BDF
-    python3 - "$1" <<'EOF'
+apply_policy() { # $1 = BDF; $2 = target generation (2 or 3)
+    python3 - "$1" "$2" <<'EOF'
 import mmap, sys
 bdf = sys.argv[1]
+gen = int(sys.argv[2]) & 3
 R = dict(MISC1=0x8841C, LTSSM=0x8872C, CFG0=0x8C040, PL_RATE=0x8C1C0,
          CYA0=0x8C2C0, OVR0=0x8E110, VAL0=0x8E120, PLM0=0x8E1B0)
 f = open(f'/sys/bus/pci/devices/{bdf}/resource0', 'r+b')
@@ -51,8 +71,8 @@ if (cap & 0xf) >= 2:
 wr(R['MISC1'], (rd(R['MISC1']) | ((1 << 11) | (1 << 13))) & ~((1 << 12) | (1 << 14)))
 wr(R['VAL0'], 0); wr(R['OVR0'], 1)
 wr(R['CYA0'], rd(R['CYA0']) & ~(1 << 2))
-wr(R['CFG0'], (rd(R['CFG0']) & ~0x000C0000) | (2 << 18))
-wr(R['PL_RATE'], (rd(R['PL_RATE']) & ~0x00060000) | 0x00040000)
+wr(R['CFG0'], (rd(R['CFG0']) & ~0x000C0000) | (gen << 18))
+wr(R['PL_RATE'], (rd(R['PL_RATE']) & ~0x00060000) | (gen << 17))
 wr(R['LTSSM'], 6)
 cap = int(subprocess.run(['setpci', '-s', bdf, 'CAP_EXP+0c.L'],
                          capture_output=True, text=True).stdout, 16)
@@ -93,6 +113,8 @@ if [[ -z "${bfds}" ]]; then
     exit 0
 fi
 
+log "requesting policy for Gen${TARGET_GEN} (override with CMP50_TARGET_GEN); will train only as high as each card advertises"
+
 deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
 while :; do
     all_fast=1
@@ -104,7 +126,7 @@ while :; do
         fi
         all_fast=0
         if (( t < 2 )); then
-            out=$(apply_policy "${bdf}" 2>/dev/null)
+            out=$(apply_policy "${bdf}" "${TARGET_GEN}" 2>/dev/null)
             case "${out}" in
                 GATE_CLOSED)
                     log "${bdf}: PLM gate not open yet; retrying"
