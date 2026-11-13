@@ -96,17 +96,24 @@ sudo reboot
 | [userspace-unlock/BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md) | Secure Boot, serial console and PCIe link speed on an ASUS X99-E WS |
 | [userspace-unlock/HANDOVER.md](userspace-unlock/HANDOVER.md) | state of a deployed host, what is proven, what is left |
 | [docs/CMP50HX.md](docs/CMP50HX.md) | reverse-engineering notes: fuses, registers, GSP, RT cores |
+| [docs/PCIE-GEN3.md](docs/PCIE-GEN3.md) | the generation-adaptive PCIe unlock (Gen3 by default, Gen2 fallback) and how to verify it |
 | [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md) | the original project README (patch-by-patch validation) |
 | [efi-unlock/README.md](efi-unlock/README.md) | the pre-OS UEFI unlock and its risks |
 
 ## What is not solved here
 
-* **PCIe Gen2.** The card is locked to Gen1 in its own link policy and the
-  patch can only adopt Gen2 when the card comes up Gen2-ready at POST. Behind a
-  PLX switch (as on the X99-E WS, where every x16 slot sits behind a PEX8747)
-  that never happens. Measured, documented, and closed — see
-  [userspace-unlock/BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md). Gen1 x16 is
-  4 GB/s and bounds only host↔GPU transfers.
+* **PCIe link speed.** The card is locked to Gen1 in its own link policy. The
+  unlock writes the card's policy registers directly to adopt a higher
+  capability, then retrains — proved at Gen2 x4 on a CPU-direct slot. The link
+  unlock is now generation-adaptive and **requests Gen3 by default**, retraining
+  only as high as each card actually adopts (so it can never ask for a speed the
+  card does not advertise); set `cmp50_target_gen=2` / `CMP50_TARGET_GEN=2` to
+  force the proven Gen2 path. See [docs/PCIE-GEN3.md](docs/PCIE-GEN3.md). Gen3 on
+  a physical card is not yet hardware-confirmed, and behind a PLX switch (as on
+  the X99-E WS, where every x16 slot sits behind a PEX8747) the card comes up
+  Gen1 regardless — a board limit, measured in
+  [userspace-unlock/BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md). The link
+  speed bounds only host↔GPU transfers; the compute unlock is unaffected.
 * **ReBAR / RT core count.** Separate patches exist in `patches/` and are
   documented in the upstream README; they are not part of the compute unlock.
 
