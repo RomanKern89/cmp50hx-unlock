@@ -65,21 +65,42 @@ The same code path was tried with a Gen3 request (policy fields set to `3`):
   fell back to the adopted generation (Gen2); no regression, no Xid.
 
 So in the path tested, the TU102 **clamps the regenerated `LNKCAP2` to Gen2**
-even when the policy requests Gen3. Gen3 is therefore **not yet reached**. This is
-not a limit of the retrain mechanism (which now works), but of how the card
-regenerates its advertised capability. Candidate avenues still open and being
-investigated:
+even when the policy requests Gen3.
 
-- explicitly writing the `LNKCAP2` Supported-Link-Speeds vector to include the
-  8.0 GT/s bit (`0x000e`) before/around the LTSSM kick, rather than relying on
-  the regen to produce it;
-- locating a TU102 PCIe-generation **fuse-override** register (analogous to the
-  SM-speed fuse override the compute unlock uses) that raises the advertised max
-  past Gen2;
-- the 170HX/GA100 `OPT_GEN` registers are unmapped on TU102 — finding their
-  TU102 equivalents, if any.
+### Why: the Gen3 capability is fuse-clamped (direct-write test, 2026-11-13)
 
-Until Gen3 is confirmed on hardware, the generation request defaults to Gen2.
+A read/write probe through the **XP3G-privileged XVE BAR0 window** — the same
+window that raised the card from Gen1 to Gen2 — shows the Gen3 capability bits
+are rejected by hardware:
+
+| write (gate open, in the OS) | readback | result |
+|---|---|---|
+| `LINK_CAP2` (`0x880a4`) `\|= 0x8` (8.0 GT/s bit) | `0x00000006` | **rejected** (bit stays clear) |
+| `LINK_CAP` (`0x88084`) max-speed field `= 3` | max-speed `= 2` | **rejected** (clamped to Gen2) |
+
+The same window writes the Gen2 fields fine (that is how Gen2 is reached), so
+this is not a window/privilege problem — the advertised max is **fuse-clamped at
+Gen2** on this SKU. Two independent methods agree: the direct privileged write is
+rejected, and the policy-driven LTSSM regen also clamps to Gen2. The GA100
+`OPT_GEN23`/`OPT_GEN3` registers are unmapped on TU102 (read `0`), and the
+pre-OS EFI path cannot help because the XP3G gate is closed before the OS.
+
+**Conclusion:** Gen3 is not reachable by any validated path. The TU102 die
+supports Gen3 (it is the RTX 2080 Ti chip), but NVIDIA fused this CMP 50HX SKU's
+PCIe link capability to Gen2, and that clamp resists every write path available,
+including the privileged one that unlocks Gen2. **Gen2 is the hardware ceiling.**
+
+The only theoretically remaining avenue is a signed-booter ROP that overrides a
+PCIe-generation fuse before GSP regenerates the config block — the analogue of
+how the compute unlock overrides the SM-speed fuses (`0x409664`/`0x40966c`). That
+is unproven: no writable PCIe-gen fuse has been located in the TU102 GSP/booter
+RE, the project's own `PCIE_GEN_EXPERIMENT` booter-fuse attempt
+(`efi-unlock/unlock50x_v1.c`) ran pre-OS where the gate is closed and was never
+validated, and the fuse may simply not be booter-overridable the way the SM-speed
+fuse is. Pursuing it is a weeks-scale reverse-engineering effort on the scale of
+the original unlock, with no guarantee of success.
+
+The generation request defaults to Gen2.
 
 ## How to select the generation
 
