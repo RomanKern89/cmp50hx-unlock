@@ -96,7 +96,8 @@ sudo reboot
 | [userspace-unlock/BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md) | Secure Boot, serial console and PCIe link speed on an ASUS X99-E WS |
 | [userspace-unlock/HANDOVER.md](userspace-unlock/HANDOVER.md) | state of a deployed host, what is proven, what is left |
 | [docs/CMP50HX.md](docs/CMP50HX.md) | reverse-engineering notes: fuses, registers, GSP, RT cores |
-| [docs/PCIE-GEN3.md](docs/PCIE-GEN3.md) | the generation-adaptive PCIe unlock (Gen3 by default, Gen2 fallback) and how to verify it |
+| [docs/GEN2-INSTALL.md](docs/GEN2-INSTALL.md) | two-step PCIe Gen2 install (works behind PLX), verify, rollback, kernel-update notes |
+| [docs/PCIE-GEN3.md](docs/PCIE-GEN3.md) | how Gen2 is trained behind a PLX switch (post-booter upstream retrain), and the Gen3 status |
 | [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md) | the original project README (patch-by-patch validation) |
 | [efi-unlock/README.md](efi-unlock/README.md) | the pre-OS UEFI unlock and its risks |
 
