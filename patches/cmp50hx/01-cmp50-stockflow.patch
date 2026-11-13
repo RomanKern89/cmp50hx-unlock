@@ -1197,7 +1197,7 @@ diff --git a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c b/src/
 index 0ee595f..48e8c82 100644
 --- a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c
 +++ b/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c
-@@ -40,6 +40,279 @@
+@@ -40,6 +40,344 @@
  #include "crashcat/crashcat_report.h"
  
  #include "published/turing/tu102/dev_gsp.h"
@@ -1267,6 +1267,71 @@ index 0ee595f..48e8c82 100644
 +{
 +    return (pGpu->idInfo.PCIDeviceID == CMP50_PC_CANARY_PCI_DEVICE_ID) &&
 +           CMP50_PC_CANARY_PCI_SUBDEVICE_MATCHES(pGpu->idInfo.PCISubDeviceID);
++}
++
++static void
++s_cmp50RetrainUpstreamGen2(OBJGPU *pGpu, const char *phase)
++{
++    void  *handle;
++    NvU32  cap;
++    NvU32  lc2;
++    NvU32  lcs;
++    NvU32  i;
++    NvU32  speed = 0U;
++
++    /* anti-brick: only retrain when the card actually adopted Gen2+ */
++    if ((GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP) & 0xFU) < 2U)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP50_GEN2: UPSTREAM_RETRAIN_SKIP_NOADOPT phase=%s cap=%08x\n",
++                  phase, GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP));
++        return;
++    }
++    if (!pGpu->gpuClData.upstreamPort.addr.valid ||
++        (pGpu->gpuClData.upstreamPort.PCIECapPtr == 0U))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "CMP50_GEN2: UPSTREAM_RETRAIN_SKIP_NOPORT phase=%s valid=%u cap=%u\n",
++                  phase, (NvU32)pGpu->gpuClData.upstreamPort.addr.valid,
++                  pGpu->gpuClData.upstreamPort.PCIECapPtr);
++        return;
++    }
++
++    handle = pGpu->gpuClData.upstreamPort.addr.handle;
++    cap = pGpu->gpuClData.upstreamPort.PCIECapPtr;
++
++    /*
++     * Retrain the immediate upstream port to Gen2 here, at the post-booter
++     * phase - before GSP-RM boots. The card has just adopted the Gen2
++     * capability (CAP>=2), so training the card<->upstream link to Gen2 now
++     * means GSP comes up to an already-trained Gen2 block and does not revert
++     * it (the revert only fires on a cold Gen1-trained link). This is what
++     * makes Gen2 stick behind a PLX switch, where the card trains Gen1 at POST
++     * and every OS-stage retrain used to be clobbered by GSP.
++     * Link Control 2 (cap+0x30): target link speed = Gen2.
++     */
++    lc2 = osPciReadDword(handle, cap + 0x30U);
++    if ((lc2 & 0xFU) != 2U)
++        osPciWriteDword(handle, cap + 0x30U, (lc2 & ~0xFU) | 2U);
++
++    /* Link Control (cap+0x10, low 16): fire Retrain Link (bit 5). */
++    lcs = osPciReadDword(handle, cap + 0x10U);
++    osPciWriteDword(handle, cap + 0x10U, lcs | (1U << 5));
++
++    for (i = 0U; i < 40U; i++)
++    {
++        osDelayUs(1000);
++        lcs = osPciReadDword(handle, cap + 0x10U);
++        speed = (lcs >> 16) & 0xFU;   /* Link Status: current link speed */
++        if (speed >= 2U)
++            break;
++    }
++
++    NV_PRINTF(LEVEL_ERROR,
++              "CMP50_GEN2: UPSTREAM_RETRAIN phase=%s lc2=%08x cur_speed=%u "
++              "attempt=%u gpu_cap=%08x status=%08x\n",
++              phase, lc2, speed, i,
++              GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP), lcs);
 +}
 +
 +static void
@@ -1477,7 +1542,7 @@ index 0ee595f..48e8c82 100644
  #include "published/turing/tu102/dev_gsp_addendum.h"
  #include "published/turing/tu102/dev_riscv_pri.h"
  #include "published/turing/tu102/dev_fbif_v4.h"
-@@ -306,6 +551,12 @@ kgspFreeBootArgs_TU102
+@@ -306,6 +644,12 @@ kgspFreeBootArgs_TU102
          memdescDestroy(pKernelGsp->pSignatureMemdesc);
          pKernelGsp->pSignatureMemdesc = NULL;
      }
@@ -1490,7 +1555,7 @@ index 0ee595f..48e8c82 100644
  
      // Release sysmem heap memory
      if (pKernelGsp->pSysmemHeapDescriptor != NULL)
-@@ -496,6 +747,86 @@ _kgspGetBooterLoadArgs
+@@ -496,6 +840,86 @@ _kgspGetBooterLoadArgs
      return 0;
  }
  
@@ -1577,7 +1642,7 @@ index 0ee595f..48e8c82 100644
  /*!
   * Boot GSP-RM.
   *
-@@ -528,6 +859,408 @@ kgspBootstrap_TU102
+@@ -528,6 +952,408 @@ kgspBootstrap_TU102
  {
      NV_STATUS status;
      KernelFalcon *pKernelFalcon = staticCast(pKernelGsp, KernelFalcon);
@@ -1986,7 +2051,7 @@ index 0ee595f..48e8c82 100644
  
      // Execute Scrubber if needed
      if (((bootMode == KGSP_BOOT_MODE_SR_RESUME) || (bootMode == KGSP_BOOT_MODE_NORMAL)) &&
-@@ -550,27 +1283,96 @@ kgspBootstrap_TU102
+@@ -550,27 +1376,97 @@ kgspBootstrap_TU102
              NV_ASSERT_OK_OR_RETURN(kflcnReset_HAL(pGpu, pKernelFalcon));
  
              status = kgspExecuteFwsec_HAL(pGpu, pKernelGsp, pKernelGsp->pPreparedFwsecCmd);
@@ -2083,12 +2148,13 @@ index 0ee595f..48e8c82 100644
 +                  postWprHi, postWprLo, postSpeed0, postSpeed1,
 +                  postPlm, postResetPlm);
 +        s_cmp50ApplyGen2Policy(pGpu, "post-booter");
++        s_cmp50RetrainUpstreamGen2(pGpu, "post-booter");
 +    }
 +
      // Send init RPCs necessary for GSP-RM booting, before creating OBJGPU.
      // Skips for suspend/resume as GSP saves/restores context
      if (bootMode == KGSP_BOOT_MODE_NORMAL)
-@@ -615,6 +1417,23 @@ kgspBootstrap_TU102
+@@ -615,6 +1511,23 @@ kgspBootstrap_TU102
  
      NV_PRINTF(LEVEL_INFO, "GSP FW RM ready.\n");
  
@@ -2112,7 +2178,7 @@ index 0ee595f..48e8c82 100644
      return NV_OK;
  }
  
-@@ -715,6 +1534,18 @@ kgspGetGspRmBootUcodeStorage_TU102
+@@ -715,6 +1628,18 @@ kgspGetGspRmBootUcodeStorage_TU102
  {
      const BINDATA_ARCHIVE *pBinArchive = kgspGetBinArchiveGspRmBoot_HAL(pKernelGsp);
  
