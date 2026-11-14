@@ -30,7 +30,13 @@ index b771a00..1a2b3c4 100644
 +MODULE_PARM_DESC(cmp50_gen2_adopt,
 +    "CMP 50HX: adopt the Gen2 capability from the driver (0=leave it to the boot service)");
 +
-+static unsigned int cmp50_target_gen = 3;
++/*
++ * Default 2 (the generation this SKU actually trains). Requesting 3 writes the
++ * Gen3 policy fields and, on this platform, makes the upstream retrain fall
++ * back to Gen1 — measured 2026-11-14 on 2x CMP 50HX behind dual PLX, code
++ * identical otherwise. Keep 2 as the shipped default; 3 is an experiment knob.
++ */
++static unsigned int cmp50_target_gen = 2;
 +module_param(cmp50_target_gen, uint, 0444);
 +MODULE_PARM_DESC(cmp50_target_gen,
 +    "CMP 50HX: highest PCIe generation to request (2=Gen2, 3=Gen3); the card is retrained only up to the generation it actually adopts, so this is a ceiling, not a force");

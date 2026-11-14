@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # CMP 50HX PCIe unlock + auto-retrain (deterministic policy method).
 #
-# Targets Gen3 (8 GT/s) by default and auto-falls-back to the highest
-# generation the card actually adopts: the policy requests the generation in
-# CMP50_TARGET_GEN (default 3, clamped to 2..3), but the outer loop only ever
-# retrains the upstream port to what the card advertises in its own target
-# (gpu_tls). So if the card accepts the Gen3 policy it trains to Gen3, and if
-# it only latches Gen2 we correctly retrain to Gen2 -- never above what the
-# card advertises. That advertised-only ladder is the anti-brick guarantee.
+# Requests the generation in CMP50_TARGET_GEN (default 2 -- the generation this
+# SKU actually trains; 3 is an experiment knob) and auto-falls back to the
+# highest generation the card actually adopts: the outer loop only ever retrains
+# the upstream port to what the card advertises in its own target (gpu_tls). So
+# if the card latches only Gen2 we retrain to Gen2 -- never above what the card
+# advertises. That advertised-only ladder is the anti-brick guarantee.
+# Measured 2026-11-14: requesting 3 makes the retrain fall back to Gen1 on this
+# board (2x CMP 50HX behind dual PLX), so 2 is the shipped default.
 #
 # The card's PCIe target-speed registers are GSP-clobbered ~100 ms after the
 # driver's boot-window policy runs, so waiting for a "self-unlock" is
@@ -34,7 +35,7 @@ RETRAIN_WAIT_SEC=3  # how long to wait for the link to come back up
 # Generation the policy requests. Default Gen3; clamp to the 2..3 range the
 # 2-bit CFG0/PL_RATE fields can encode. The card still only trains as high as
 # it advertises (see gpu_tls / the header's anti-brick note).
-TARGET_GEN=${CMP50_TARGET_GEN:-3}
+TARGET_GEN=${CMP50_TARGET_GEN:-2}
 if ! [[ "${TARGET_GEN}" =~ ^[0-9]+$ ]] || (( TARGET_GEN < 2 )); then
     TARGET_GEN=2
 elif (( TARGET_GEN > 3 )); then
