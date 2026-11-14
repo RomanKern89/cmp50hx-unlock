@@ -120,17 +120,14 @@ Gen2; (3) the GSP firmware does not touch the ceiling; (4) the published source
 exposes no Gen3 force path and no supported-speeds / fuse-override register on
 Turing; (5) the driver's own maximum force is Gen2.
 
-The one write not yet tried is the same `LINK_CAP`/`LINK_CAP2` write routed through
-the **falcon-privileged SEC2 booter CSB** (the primitive that lands the SM-speed
-override, `efi-unlock/unlock50x_v1.c` `own_code_67`) instead of the MMIO window.
-It is a *directed* test — known target (`0x88084`/`0x880a4`), known value (Gen3
-bits) — but low odds: `LINK_CAP2` is a capability register driven combinationally
-from the supported-speeds vector, so a falcon-priv write to its alias is unlikely
-to differ from the already-rejected MMIO write, and no writable latch for it exists
-in any regmap. **Gen2 remains the hardware ceiling; Gen3 is not reachable by any
-validated or principled path.**
+The last write not yet tried was the same `LINK_CAP`/`LINK_CAP2` write routed
+through the **falcon-privileged SEC2 booter CSB** (the primitive that lands the
+SM-speed override, `efi-unlock/unlock50x_v1.c` `own_code_67`) instead of the MMIO
+window. It has now been executed from EFI pre-OS with a positive control and it
+was refused — see "Result of the executed run" below. **Gen2 is the hardware
+ceiling; Gen3 is not reachable by any validated or principled path.**
 
-### Directed CSB capability probe (EFI, staged 2026-11-14, not yet run)
+### Directed CSB capability probe (EFI, executed 2026-11-14) — Gen3 refused
 
 `unlock50x_v1.c` now carries a build-flagged probe (`-DPCIE_GEN_EXPERIMENT`,
 enabled in `efi-unlock/build.sh`) that performs exactly that last write from EFI,
@@ -169,12 +166,55 @@ Verdicts written to `\50hx_log.txt` on the ESP as `GEN3-VERDICT:` lines:
   Gen3 (`LINK_CAP2` bit 3). Gen3 becomes reachable in principle; continue with
   policy + upstream retrain.
 - `ALIAS_ONLY` — BAR0 alias accepted it, config space still Gen2. Not usable.
-- `FUSE_CLAMPED` — both rejected: the seventh, final proof of the netlist fuse.
+- `FUSE_CLAMPED` — both rejected: the proof of the netlist fuse.
 - `SLOT_LAYOUT_MISMATCH` / `chain did not run` — no verdict, payload or chain
   precondition failed; fix before drawing conclusions.
 
-Deployment is one-shot (`efibootmgr --bootnext`, entry created but not default),
-so the standard boot order and the kernel pin are untouched.
+### Result of the executed run (2026-11-14) — `FUSE_CLAMPED`
+
+Five one-shot boots were needed to make the experiment valid; each one is
+recorded in `GEN3-PROBE-RUN-2026-11-14.md`. The two findings that shaped the
+final design:
+
+1. **A second booter run never executes the ROP chain.** The SEC2 ACR mutex is
+   still owned, so a re-run boots and spins; a control write of `SS1` — a
+   register the chain itself writes — was refused, proving the re-run made no
+   write at all. The probe therefore has to ride the *first* run.
+2. **The XP3G privilege gate is closed pre-OS** (`0x8E1B0` reads `0xFFFFFF8F`)
+   and host MMIO cannot open it, so a "write rejected" result from EFI is
+   meaningless unless the gate is opened first — by the CSB itself.
+
+The final run does exactly that in one pass, using the two write slots of the
+stock chain: slot #1 opens the gate, slot #2 carries the Gen3 write. Result:
+
+```
+GEN3-PROBE pre:  CAP2=0x00000002 XP3G=0xffffff8f PLM=0xfffffe8e SS0=0x00000000
+GEN3-PROBE post: CAP2=0x00000002 XP3G=0xffffffff  PLM=0xffffff8f SS0=0x00000000
+GEN3-VERDICT: CTRL XP3G gate 0x0008e1b0 -> 0xffffffff = CSB_WRITE_LANDED
+GEN3-VERDICT: TEST LINK_CAP2 0x000880a4 -> 0x00000002 = GEN3_BIT_REFUSED
+GEN3-VERDICT: cfgCAP2=0x00000002 cfgCAP=0x10453d01 (OS-visible view)
+GEN3-VERDICT: FUSE_CLAMPED
+```
+
+The control and the test are in the **same** executed chain, so this is the
+first time the two hypotheses are separated: the privileged write path is alive
+(it opened a gate the host cannot touch pre-OS) and `LINK_CAP2` still refuses the
+8.0 GT/s bit. With the OS-side rejection (gate open, XVE write) this is the
+**seventh and final proof**: the capability is fused, not gated.
+
+A second controlled run closed the last documented lever of the CMP90 recipe:
+the `0x823810` PCIe fuse-override page reads poison (`0xbadf5040`) and refuses
+writes **even in the pre-OS booter window**, while the control write in the same
+run lands (`0x8E1B0: 0xffffff8f -> 0xffffffff`). No writer is left to try.
+
+Operational caveat: opening the XP3G gate also makes the application's ReBAR step
+succeed, and a 16 GiB BAR1 left behind breaks PCI enumeration in the OS. The
+probe build therefore compiles step [11] out (`#ifdef PCIE_GEN_EXPERIMENT`); see
+`GEN3-PROBE-RUN-2026-11-14.md` for the incident and the one-reboot recovery.
+
+By-product: the EFI application can now open the XP3G gate pre-OS through CSB
+and run two arbitrary directed BAR0 writes per boot with a positive control —
+reusable for any register the OS only reaches after GSP-RM starts.
 
 The generation request defaults to Gen2.
 

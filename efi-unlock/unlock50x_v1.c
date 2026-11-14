@@ -2772,48 +2772,86 @@ do_flr(void)
 /* ==== PCIe Gen3 capability probe (flag PCIE_GEN_EXPERIMENT) ====
  * Directed test only — this is NOT the shipped unlock path.
  *
- * Question: can the falcon-privileged SEC2 CSB write (the primitive the V67
- * chain uses to land PLM/SS0) change the PCIe capability registers that the
- * host BAR0 MMIO path rejects on TU102?
- *   host MMIO, gate open:  LINK_CAP2 |= 0x8      -> readback 0x00000006
- *                          LINK_CAP max_speed=3  -> readback 2
- * The chain is left intact; only the SECOND write pair of the stock payload
- * is repointed at the probe target, so write #1 (FECS PLM = open) still runs
- * first and the gate context stays identical to production.
+ * Question: can the falcon-privileged SEC2 CSB write reach the PCIe capability
+ * registers that the host/OS path refuses to raise to Gen3?
  *
- * Slot layout of blobs/v67_payload.bin (verified word by word, 2026-11-14):
- *   0xF95C value 0xFFFFFFFF -> 0xF974 addr 0x00409650   (FECS PLM = open)
- *   0xF988 value 0x88888888 -> 0xF9A4 addr 0x00409664   (FECS SS0 = full)
- *   0xF9B8 value 0x00000000 -> post-lock write
- * Each extra booter run performs exactly one directed CSB write. No LTSSM
- * kick and no FLR, so a rejected capability cannot disturb a trained link.
- * NOTE: earlier notes pointed at {value@0xF948, addr@0xF960}; those words are
- * a chain guard and a continuation gadget, not a write pair — writing them
- * corrupts the chain instead of probing a register. The real pair is below,
- * and pcie_gen_probe() refuses to run if the payload does not match it. */
+ * Two hard-won constraints decide the shape of this probe (runs 1-4,
+ * 2026-11-14, on the dual-PLX board):
+ *   1. A SECOND booter run does not reach the ROP chain: the SEC2 ACR mutex is
+ *      still owned, so the write the chain performs on its first run does not
+ *      land on a re-run (build 4, CTRL-A: SS1 stayed 0x00000008). The probe
+ *      must therefore ride the FIRST run.
+ *   2. The XP3G privilege gate (BAR0 0x8E1B0) reads 0xFFFFFF8F (closed) at the
+ *      pre-OS stage and refuses host writes; the CMP50 driver chain opens it
+ *      through CSB. Opening it is part of the test, not a prerequisite.
+ *
+ * So the two usable write slots of the stock chain are repurposed:
+ *   #1  value@0xF95C / addr@0xF974  ->  open the XP3G gate  (positive control)
+ *   #2  value@0xF988 / addr@0xF9A4  ->  Gen3 capability write (the test)
+ * The compute unlock (PLM 0x409650 / SS0 0x409664) is deliberately not
+ * attempted on this boot; the OS driver performs it anyway.
+ *
+ * Slot layout of blobs/v67_payload.bin (verified word by word):
+ *   0xF95C 0xFFFFFFFF -> 0xF974 0x00409650   (FECS PLM = open)
+ *   0xF988 0x88888888 -> 0xF9A4 0x00409664   (FECS SS0 = full)
+ * NOTE: an earlier note (and the userspace patch_tool.py slot) named
+ * {value@0xF948, addr@0xF960}; those words are a chain guard and a
+ * continuation gadget, not a write pair. The real pairs are above, and this
+ * probe refuses to run if the payload does not match them. */
 #ifdef PCIE_GEN_EXPERIMENT
 #define XVE_LINK_CAP          0x00088084u
 #define XVE_LINK_CTRL_STATUS  0x00088088u
 #define XVE_LINK_CAP2         0x000880a4u
 #define XVE_LINK_CTRL_2       0x000880a8u
+#define XVE_XP3G_PLM          0x0008e1b0u   /* XP3G privilege gate: 0xffffffff = open */
+#define XVE_SM_SPEED_1        0x0040966cu   /* SS1: 0x00000008 = full */
 
+#define V67_SLOT1_VALUE       0x0000F95Cu
+#define V67_SLOT1_ADDR        0x0000F974u
+#define V67_SLOT1_STOCK_VALUE 0xFFFFFFFFu
+#define V67_SLOT1_STOCK_ADDR  0x00409650u
 #define V67_SLOT2_VALUE       0x0000F988u
 #define V67_SLOT2_ADDR        0x0000F9A4u
 #define V67_SLOT2_STOCK_VALUE 0x88888888u
 #define V67_SLOT2_STOCK_ADDR  0x00409664u
 
+/* Build-time experiment selection. Default: open the XP3G gate (positive
+ * control) and write the Gen3 capability (test). The CMP90 fuse-override shot
+ * is one build flag away, e.g.:
+ *   -DGEN3_SLOT1_ADDR=0x823810u -DGEN3_SLOT1_VALUE=0u
+ * Slot #1 doubles as the control: its target always starts at a known value,
+ * so a landed write is unambiguous. */
+#ifndef GEN3_SLOT1_ADDR
+#define GEN3_SLOT1_ADDR   XVE_XP3G_PLM
+#endif
+#ifndef GEN3_SLOT1_VALUE
+#define GEN3_SLOT1_VALUE  0xFFFFFFFFu
+#endif
+#ifndef GEN3_SLOT2_ADDR
+#define GEN3_SLOT2_ADDR   XVE_LINK_CAP2
+#endif
+#ifndef GEN3_SLOT2_VALUE
+#define GEN3_SLOT2_VALUE  0x0000000Eu
+#endif
+
 static BOOLEAN s_gen3ProbeDone;
+static BOOLEAN s_gen3ProbeArmed;
+static UINT32  s_gen3GatePre, s_gen3Cap2Pre;
 static UINT32  s_pcieCapOff;   /* PCIe capability base in host config space */
 
-/* Host config-space view of Link Cap / Link Cap 2 — this is what the OS
- * reports, as opposed to the BAR0 XVE alias. */
+/* Defined further down; config-space access must follow the card's discovery
+ * encode (CF8 vs RootBridgeIo) — plain cfg_read32() returns zeros on this host. */
+static UINT32 rebar_rd(UINTN reg);
+
+/* Host config-space view of Link Cap / Link Cap 2 — what the OS reports, as
+ * opposed to the BAR0 XVE alias. */
 static void
 pcie_gen_cfg_status(const CHAR16 *tag)
 {
-    UINT32 capPtr = cfg_read32(0x34) & 0xFF, hdr = 0, i = 0;
+    UINT32 capPtr = rebar_rd(0x34) & 0xFF, hdr = 0, i = 0;
 
     while (capPtr && capPtr < 0x100 && i++ < 48) {
-        hdr = cfg_read32(capPtr);
+        hdr = rebar_rd(capPtr);
         if ((hdr & 0xFF) == 0x10) break;
         capPtr = (hdr >> 8) & 0xFF;
     }
@@ -2823,8 +2861,8 @@ pcie_gen_cfg_status(const CHAR16 *tag)
     }
     s_pcieCapOff = capPtr;
     Print(L"GEN3-PROBE cfg %s: LNKCAP(0x%02x)=0x%08x LNKCAP2(0x%02x)=0x%08x\n",
-          tag, capPtr + 0x0C, cfg_read32(capPtr + 0x0C),
-          capPtr + 0x2C, cfg_read32(capPtr + 0x2C));
+          tag, capPtr + 0x0C, rebar_rd(capPtr + 0x0C),
+          capPtr + 0x2C, rebar_rd(capPtr + 0x2C));
 }
 
 static void
@@ -2832,97 +2870,109 @@ pcie_gen_status(const CHAR16 *tag)
 {
     UINT32 st = mmio_read32(XVE_LINK_CTRL_STATUS);
     Print(L"GEN3-PROBE %s: LNKSTA=0x%08x speed=%d width=%d CAP=0x%08x "
-          L"CAP2=0x%08x LC2=0x%08x PLM=0x%08x SS0=0x%08x\n",
+          L"CAP2=0x%08x LC2=0x%08x XP3G=0x%08x PLM=0x%08x SS0=0x%08x SS1=0x%08x\n",
           tag, st, (INTN)((st >> 16) & 0xF), (INTN)((st >> 4) & 0x3F),
           mmio_read32(XVE_LINK_CAP), mmio_read32(XVE_LINK_CAP2),
-          mmio_read32(XVE_LINK_CTRL_2),
-          mmio_read32(REG_FEAT_OVR_PLM), mmio_read32(REG_FEAT_OVR_SM_SPD));
+          mmio_read32(XVE_LINK_CTRL_2), mmio_read32(XVE_XP3G_PLM),
+          mmio_read32(REG_FEAT_OVR_PLM), mmio_read32(REG_FEAT_OVR_SM_SPD),
+          mmio_read32(REG_FEAT_OVR_SM_SPD_1));
     pcie_gen_cfg_status(tag);
 }
 
-/* One directed write: repoint the chain's 2nd write pair, re-run the booter,
- * read the target back through host MMIO. */
-static BOOLEAN
-pcie_gen_probe_write(UINT64 wprMetaPhys, UINT64 ucodePhys, UINT64 v67Phys,
-                     BOOLEAN useV67, UINT32 addr, UINT32 value,
-                     const CHAR16 *name)
-{
-    volatile UINT32 *pv = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_VALUE);
-    volatile UINT32 *pa = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_ADDR);
-    UINT32 pre = mmio_read32(addr), post;
-    EFI_STATUS s;
-
-    Print(L"GEN3-PROBE %s: target 0x%06x pre=0x%08x want=0x%08x\n",
-          name, addr, pre, value);
-    *pv = value;
-    *pa = addr;
-    __asm__ volatile("wbinvd" ::: "memory");
-    s = useV67 ? booter_load_v67(wprMetaPhys, ucodePhys)
-               : booter_load_tu102_direct(wprMetaPhys, ucodePhys);
-    uefi_call_wrapper(BS->Stall, 1, 200000);
-    post = mmio_read32(addr);
-    Print(L"GEN3-PROBE %s: run=%r post=0x%08x -> %s\n", name, s, post,
-          (post == value) ? L"WRITE_ACCEPTED" : L"WRITE_REJECTED");
-    pcie_gen_status(L"after");
-    /* always restore the stock pair: a poisoned payload would silently
-     * change every later run (and the unlock write #2) */
-    *pv = V67_SLOT2_STOCK_VALUE;
-    *pa = V67_SLOT2_STOCK_ADDR;
-    __asm__ volatile("wbinvd" ::: "memory");
-    return (post == value) ? TRUE : FALSE;
-}
-
+/* Arm the payload before the single booter run: slot #1 opens the XP3G gate,
+ * slot #2 carries the Gen3 capability write. */
 static void
-pcie_gen_probe(UINT64 wprMetaPhys, UINT64 ucodePhys, UINT64 v67Phys,
-               BOOLEAN useV67)
+pcie_gen_probe_pre(UINT64 v67Phys)
 {
-    UINT32 stockV = *(volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_VALUE);
-    UINT32 stockA = *(volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_ADDR);
-    UINT32 cap;
-    BOOLEAN cap2Ok, capOk;
+    volatile UINT32 *pv1 = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT1_VALUE);
+    volatile UINT32 *pa1 = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT1_ADDR);
+    volatile UINT32 *pv2 = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_VALUE);
+    volatile UINT32 *pa2 = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_ADDR);
+    UINT32 v1 = *pv1, a1 = *pa1, v2 = *pv2, a2 = *pa2;
 
-    Print(L"\n=== GEN3-PROBE: card %02x:%02x.%x, loader=%s ===\n",
-          (INTN)gBus, (INTN)gDev, (INTN)gFn, useV67 ? L"v67" : L"direct");
-    /* negative control: if the payload is not the stock V67 chain the slot
-     * offsets mean nothing — refuse instead of writing into random words */
-    if (stockV != V67_SLOT2_STOCK_VALUE || stockA != V67_SLOT2_STOCK_ADDR) {
-        Print(L"GEN3-VERDICT: SLOT_LAYOUT_MISMATCH value=0x%08x addr=0x%08x "
-              L"— probe aborted\n", stockV, stockA);
+    Print(L"\n=== GEN3-PROBE card %02x:%02x.%x exp{#1=0x%06x #2=0x%06x} ===\n",
+          (INTN)gBus, (INTN)gDev, (INTN)gFn,
+          (UINT32)GEN3_SLOT1_ADDR, (UINT32)GEN3_SLOT2_ADDR);
+    /* negative control: the slot offsets only mean something on the stock chain */
+    if (v1 != V67_SLOT1_STOCK_VALUE || a1 != V67_SLOT1_STOCK_ADDR ||
+        v2 != V67_SLOT2_STOCK_VALUE || a2 != V67_SLOT2_STOCK_ADDR) {
+        Print(L"GEN3-VERDICT: SLOT_LAYOUT_MISMATCH w1=0x%08x a1=0x%08x "
+              L"w2=0x%08x a2=0x%08x — probe not armed\n", v1, a1, v2, a2);
         return;
     }
+    s_gen3GatePre = mmio_read32(GEN3_SLOT1_ADDR);
+    s_gen3Cap2Pre = mmio_read32(GEN3_SLOT2_ADDR);
     pcie_gen_status(L"pre");
 
-    cap2Ok = pcie_gen_probe_write(wprMetaPhys, ucodePhys, v67Phys, useV67,
-                                  XVE_LINK_CAP2, 0x0000000Eu, L"LINK_CAP2=0x0e");
-    cap = mmio_read32(XVE_LINK_CAP);
-    capOk = pcie_gen_probe_write(wprMetaPhys, ucodePhys, v67Phys, useV67,
-                                 XVE_LINK_CAP, (cap & ~0xFu) | 3u, L"LINK_CAP.ms=3");
+    *pv1 = GEN3_SLOT1_VALUE;   /* slot #1: control write */
+    *pa1 = GEN3_SLOT1_ADDR;
+    *pv2 = GEN3_SLOT2_VALUE;   /* slot #2: the test write */
+    *pa2 = GEN3_SLOT2_ADDR;
+    __asm__ volatile("wbinvd" ::: "memory");
+    s_gen3ProbeArmed = TRUE;
+    Print(L"GEN3-PROBE armed: #1 {0x%08x -> 0x%06x} #2 {0x%08x -> 0x%06x}\n",
+          (UINT32)GEN3_SLOT1_VALUE, (UINT32)GEN3_SLOT1_ADDR,
+          (UINT32)GEN3_SLOT2_VALUE, (UINT32)GEN3_SLOT2_ADDR);
+}
 
-    Print(L"GEN3-VERDICT: CAP2=0x%08x (gen3 bit %s) CAP=0x%08x (max_speed=%d, "
-          L"gen3 %s)\n",
-          mmio_read32(XVE_LINK_CAP2), cap2Ok ? L"ACCEPTED" : L"REJECTED",
-          mmio_read32(XVE_LINK_CAP),
-          (INTN)(mmio_read32(XVE_LINK_CAP) & 0xFu),
-          capOk ? L"ACCEPTED" : L"REJECTED");
+/* Read the verdict after the run. The gate is the positive control: it reads
+ * 0xFFFFFF8F (closed) before the run, so a landed CSB write is unmistakable. */
+static void
+pcie_gen_probe_post(void)
+{
+    UINT32 ctrl, test, gate, cap;
+
+    if (!s_gen3ProbeArmed) {
+        Print(L"GEN3-VERDICT: NOT_ARMED — probe never reached the payload\n");
+        return;
+    }
+    s_gen3ProbeArmed = FALSE;
+
+    pcie_gen_status(L"post");
+    ctrl = mmio_read32(GEN3_SLOT1_ADDR);
+    test = mmio_read32(GEN3_SLOT2_ADDR);
+    gate = mmio_read32(XVE_XP3G_PLM);
+    cap  = mmio_read32(XVE_LINK_CAP);
+
+    Print(L"GEN3-VERDICT: CTRL 0x%06x -> 0x%08x (pre 0x%08x, want 0x%08x) = %s\n",
+          (UINT32)GEN3_SLOT1_ADDR, ctrl, s_gen3GatePre, (UINT32)GEN3_SLOT1_VALUE,
+          (ctrl == (UINT32)GEN3_SLOT1_VALUE) ? L"CSB_WRITE_LANDED" : L"CSB_WRITE_REFUSED");
+    Print(L"GEN3-VERDICT: TEST 0x%06x -> 0x%08x (pre 0x%08x, want 0x%08x) = %s\n",
+          (UINT32)GEN3_SLOT2_ADDR, test, s_gen3Cap2Pre, (UINT32)GEN3_SLOT2_VALUE,
+          (test == (UINT32)GEN3_SLOT2_VALUE) ? L"ACCEPTED" : L"REFUSED");
+    Print(L"GEN3-VERDICT: XP3G=0x%08x LINK_CAP=0x%08x (max_speed=%d)\n",
+          gate, cap, (INTN)(cap & 0xFu));
     {
-        UINT32 cfgCap2 = s_pcieCapOff ? cfg_read32(s_pcieCapOff + 0x2C) : 0;
-        UINT32 cfgCap  = s_pcieCapOff ? cfg_read32(s_pcieCapOff + 0x0C) : 0;
+        UINT32 cfgCap2 = s_pcieCapOff ? rebar_rd(s_pcieCapOff + 0x2C) : 0;
+        UINT32 cfgCap  = s_pcieCapOff ? rebar_rd(s_pcieCapOff + 0x0C) : 0;
         BOOLEAN cfgGen3 = (cfgCap2 & 0x8u) ? TRUE : FALSE;
+        BOOLEAN ctrlOk = (ctrl == (UINT32)GEN3_SLOT1_VALUE) ? TRUE : FALSE;
+        BOOLEAN testOk = (test == (UINT32)GEN3_SLOT2_VALUE) ? TRUE : FALSE;
 
         Print(L"GEN3-VERDICT: cfgCAP2=0x%08x cfgCAP=0x%08x (OS-visible view)\n",
               s_pcieCapOff ? cfgCap2 : 0xFFFFFFFFu,
               s_pcieCapOff ? cfgCap : 0xFFFFFFFFu);
-        if (!s_pcieCapOff)
-            Print(L"GEN3-VERDICT: CONFIG_SPACE_UNAVAILABLE — verdict is BAR0-only\n");
-        else if ((cap2Ok || capOk) && cfgGen3)
-            Print(L"GEN3-VERDICT: WRITABLE_LATCH — CSB capability write landed "
-                  L"and config space advertises Gen3; Gen3 reachable in principle\n");
-        else if (cap2Ok || capOk)
+        if (!ctrlOk)
+            Print(L"GEN3-VERDICT: INCONCLUSIVE — the control write did not land "
+                  L"(0x%06x reads 0x%08x): this run says nothing about the fuse\n",
+                  (UINT32)GEN3_SLOT1_ADDR, ctrl);
+        else if ((UINT32)GEN3_SLOT2_ADDR != XVE_LINK_CAP2)
+            Print(L"GEN3-VERDICT: CUSTOM_TARGET — control path live, target 0x%06x "
+                  L"%s (wanted 0x%08x, reads 0x%08x)\n",
+                  (UINT32)GEN3_SLOT2_ADDR,
+                  testOk ? L"ACCEPTED the write" : L"REFUSED the write",
+                  (UINT32)GEN3_SLOT2_VALUE, test);
+        else if (testOk && cfgGen3)
+            Print(L"GEN3-VERDICT: WRITABLE_LATCH — the write landed and config "
+                  L"space advertises Gen3: Gen3 is reachable on this SKU\n");
+        else if (testOk)
             Print(L"GEN3-VERDICT: ALIAS_ONLY — BAR0 accepted the write but config "
                   L"space still does not advertise Gen3\n");
         else
-            Print(L"GEN3-VERDICT: FUSE_CLAMPED — 7th proof, Gen3 impossible on "
-                  L"this SKU\n");
+            Print(L"GEN3-VERDICT: REFUSED_WITH_LIVE_PATH — the control write landed "
+                  L"(0x%06x: 0x%08x -> 0x%08x) while the Gen3 capability was still "
+                  L"refused: the ceiling is in the capability register, not in the "
+                  L"writer\n", (UINT32)GEN3_SLOT1_ADDR, s_gen3GatePre, ctrl);
     }
 }
 #endif /* PCIE_GEN_EXPERIMENT */
@@ -4844,6 +4894,14 @@ u50_unlock_card(EFI_HANDLE ImageHandle)
                 u40x_booter_sig_prod, sizeof(u40x_booter_sig_prod));
     }
     __asm__ volatile("wbinvd" ::: "memory");
+#ifdef PCIE_GEN_EXPERIMENT
+    /* [9a] arm the payload of the ONE booter run: slot #1 = XP3G gate,
+     * slot #2 = Gen3 capability write (first card only). */
+    if (!s_gen3ProbeDone && v67Phys) {
+        s_gen3ProbeDone = TRUE;
+        pcie_gen_probe_pre(v67Phys);
+    }
+#endif
     Print(L"[50HX] booter_load_tu102_direct (ports, BOOTVEC=0, RM=0x162000A1)...\n");
     Status = booter_load_tu102_direct(wprMetaPhys, ucodePhys);
     Print(L"[50HX] booter_load_tu102_direct returned %r\n", Status);
@@ -4859,20 +4917,13 @@ u50_unlock_card(EFI_HANDLE ImageHandle)
     uefi_call_wrapper(BS->Stall, 1, 500000);
     dump_regs(L"[v55 post-booter]");
 
-    /* ---------- [9b] PCIe Gen3 capability probe (dev build only) ----------
-     * Runs once, on the first card, only when the chain demonstrably executed
-     * (PLM read back open). Each probe = one patched payload + one extra booter
-     * run; the target register is read back through host MMIO. */
+    /* ---------- [9b] read the Gen3 probe verdict (dev build only) ----------
+     * The probe rode the run above, so the registers are read here. In this
+     * build the compute unlock is intentionally not attempted (slot #1 carries
+     * the XP3G gate instead of the FECS PLM write): the OS driver unlocks. */
 #ifdef PCIE_GEN_EXPERIMENT
-    if (!s_gen3ProbeDone) {
-        s_gen3ProbeDone = TRUE;
-        if (v67Phys && mmio_read32(REG_FEAT_OVR_PLM) == VAL_PLM_OPEN) {
-            pcie_gen_probe(wprMetaPhys, ucodePhys, v67Phys, g_booterUsedV67);
-        } else {
-            Print(L"GEN3-PROBE: skipped (status=%r PLM=0x%08x) — chain did not run\n",
-                  Status, mmio_read32(REG_FEAT_OVR_PLM));
-        }
-    }
+    if (s_gen3ProbeArmed)
+        pcie_gen_probe_post();
 #endif
 
     /* ---------- [10] 判定 + cleanup ---------- */
@@ -4937,13 +4988,22 @@ u50_unlock_card(EFI_HANDLE ImageHandle)
 done:
     dump_regs(L"[v55 final]");
     /* ---------- [11] best-effort ReBAR (BAR1); reverts on any failed
-     * check — see u40x_rebar_try ---------- */
+     * check — see u40x_rebar_try ----------
+     * SKIPPED in the Gen3 probe build: opening the XP3G gate makes this
+     * resize actually succeed, and a 16 GiB BAR1 left behind breaks PCI
+     * enumeration in the OS ("BAR 1 [mem size 0x400000000]: can't assign"),
+     * which cost one card its driver on 2026-11-14. A probe must not change
+     * the memory map it cannot undo. */
+#ifdef PCIE_GEN_EXPERIMENT
+    Print(L"[rebar] skipped (Gen3 probe build: no irreversible BAR resize)\n");
+#else
     if (u40x_rebar32(ImageHandle)) {
         Print(L"[rebar] rebar=32g: attempting 32 GiB BAR1 (issue #47)\n");
         u40x_rebar_try(0x800000000ULL, 9U);
     } else {
         u40x_rebar_try(0x400000000ULL, 8U);
     }
+#endif
     /* Per-card verdict for the caller: EFI_SUCCESS also covers the two
      * short paths above ([4] already-unlocked / direct probe), where no
      * booter had to run. */
