@@ -2865,10 +2865,86 @@ pcie_gen_cfg_status(const CHAR16 *tag)
           capPtr + 0x2C, rebar_rd(capPtr + 0x2C));
 }
 
+/* Engine-fuse view for the fuse-shadow probe (2026-11-14, NVLink question).
+ * NV_FUSE_OPT_NVDEC_DISABLE (0x21378, tu102/dev_fuse.h) reads 0x7 on CMP 50HX
+ * and NVDEC is absent from PTOP, exactly like the NVLink IOCTRL. PTOP layout
+ * (Turing, 64 words at 0x22700): bits 1:0 = 3 is ENGINE_TYPE, type in 30:2;
+ * NVDEC = 0x10, IOCTRL (NVLink) = 0x12 (nouveau nvkm/subdev/top/gk104.c). */
+#define FUSE_OPT_NVDEC_DISABLE 0x00021378u
+#define PTOP_DEVICE_INFO0      0x00022700u
+static void
+fuse_ptop_status(const CHAR16 *tag)
+{
+    UINT32 i, d, t, n = 0, nvdec = 0, ioctrl = 0, mask = 0;
+
+    for (i = 0; i < 64; i++) {
+        d = mmio_read32(PTOP_DEVICE_INFO0 + 4u * i);
+        if ((d & 3u) != 3u)
+            continue;
+        t = (d & 0x7FFFFFFCu) >> 2;
+        n++;
+        if (t < 32u)
+            mask |= (1u << t);
+        if (t == 0x10u) nvdec++;
+        if (t == 0x12u) ioctrl++;
+    }
+    Print(L"FUSE-PROBE %s: NVDEC_DISABLE(0x21378)=0x%08x PTOP engines=%d "
+          L"typemask=0x%08x NVDEC=%d IOCTRL=%d\n",
+          tag, mmio_read32(FUSE_OPT_NVDEC_DISABLE), (INTN)n, mask,
+          (INTN)nvdec, (INTN)ioctrl);
+}
+
+/* Is the engine table itself writable on TU102? The published headers disagree
+ * across chips — GA100 marks NV_PTOP_DEVICE_INFO2 read-only (R--4A), GB100
+ * marks it read-write (RW-4A) — and Turing is not published at all. If the
+ * table accepts writes, a missing engine could in principle be re-added; if it
+ * is ROM, only the fuse/strap can decide presence. The test writes a sentinel
+ * into an unused row, reads it back and restores the original word at once. */
+#define PTOP_DEVICE_INFO_CFG 0x000224FCu
+static void
+ptop_write_probe(void)
+{
+    UINT32 cfg = mmio_read32(PTOP_DEVICE_INFO_CFG);
+    UINT32 i, orig, rb, off = 0, found = 0;
+
+    Print(L"PTOP-WRITE: CFG(0x224FC)=0x%08x num_rows=%d max_dev=%d max_rows_per_dev=%d\n",
+          cfg, (INTN)((cfg >> 20) & 0xFFFU), (INTN)((cfg >> 4) & 0xFFFU),
+          (INTN)((cfg >> 16) & 0xFU));
+
+    for (i = 0; i < 64; i++) {
+        UINT32 v = mmio_read32(PTOP_DEVICE_INFO0 + 4u * i);
+        if (i < 32)
+            Print(L"PTOP-WRITE: [%02d]=0x%08x\n", i, v);
+        if (!found && (v & 3u) != 3u && v == 0) {
+            off = PTOP_DEVICE_INFO0 + 4u * i;
+            found = 1;
+        }
+    }
+    if (!found) {
+        Print(L"PTOP-WRITE: no unused row — test skipped\n");
+        return;
+    }
+    orig = mmio_read32(off);
+    mmio_write32(off, 0xDEADBEEFu);
+    rb = mmio_read32(off);
+    mmio_write32(off, orig);
+    Print(L"PTOP-WRITE: off=0x%06x wrote=0xdeadbeef readback=0x%08x -> %s\n",
+          off, rb, (rb == 0xDEADBEEFu) ? L"WRITABLE" : L"READ_ONLY");
+
+    /* same question for the CFG word, restored immediately */
+    mmio_write32(PTOP_DEVICE_INFO_CFG, cfg ^ 0x00010000u);
+    rb = mmio_read32(PTOP_DEVICE_INFO_CFG);
+    mmio_write32(PTOP_DEVICE_INFO_CFG, cfg);
+    Print(L"PTOP-WRITE: CFG wrote=0x%08x readback=0x%08x -> %s\n",
+          cfg ^ 0x00010000u, rb,
+          (rb == (cfg ^ 0x00010000u)) ? L"WRITABLE" : L"READ_ONLY");
+}
+
 static void
 pcie_gen_status(const CHAR16 *tag)
 {
     UINT32 st = mmio_read32(XVE_LINK_CTRL_STATUS);
+    fuse_ptop_status(tag);
     Print(L"GEN3-PROBE %s: LNKSTA=0x%08x speed=%d width=%d CAP=0x%08x "
           L"CAP2=0x%08x LC2=0x%08x XP3G=0x%08x PLM=0x%08x SS0=0x%08x SS1=0x%08x\n",
           tag, st, (INTN)((st >> 16) & 0xF), (INTN)((st >> 4) & 0x3F),
@@ -2903,6 +2979,7 @@ pcie_gen_probe_pre(UINT64 v67Phys)
     s_gen3GatePre = mmio_read32(GEN3_SLOT1_ADDR);
     s_gen3Cap2Pre = mmio_read32(GEN3_SLOT2_ADDR);
     pcie_gen_status(L"pre");
+    ptop_write_probe();
 
     *pv1 = GEN3_SLOT1_VALUE;   /* slot #1: control write */
     *pa1 = GEN3_SLOT1_ADDR;
@@ -2956,6 +3033,13 @@ pcie_gen_probe_post(void)
             Print(L"GEN3-VERDICT: INCONCLUSIVE — the control write did not land "
                   L"(0x%06x reads 0x%08x): this run says nothing about the fuse\n",
                   (UINT32)GEN3_SLOT1_ADDR, ctrl);
+        else if ((UINT32)GEN3_SLOT2_ADDR >= 0x21000u && (UINT32)GEN3_SLOT2_ADDR < 0x22000u)
+            Print(L"FUSE-VERDICT: control path live; fuse shadow 0x%06x %s "
+                  L"(pre 0x%08x, wanted 0x%08x, reads 0x%08x)\n",
+                  (UINT32)GEN3_SLOT2_ADDR,
+                  testOk ? L"ACCEPTED the write (FUSE_SHADOW_WRITABLE)"
+                         : L"REFUSED the write (FUSE_SHADOW_LOCKED)",
+                  s_gen3Cap2Pre, (UINT32)GEN3_SLOT2_VALUE, test);
         else if ((UINT32)GEN3_SLOT2_ADDR != XVE_LINK_CAP2)
             Print(L"GEN3-VERDICT: CUSTOM_TARGET — control path live, target 0x%06x "
                   L"%s (wanted 0x%08x, reads 0x%08x)\n",
