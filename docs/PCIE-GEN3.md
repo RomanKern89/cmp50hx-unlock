@@ -130,6 +130,52 @@ to differ from the already-rejected MMIO write, and no writable latch for it exi
 in any regmap. **Gen2 remains the hardware ceiling; Gen3 is not reachable by any
 validated or principled path.**
 
+### Directed CSB capability probe (EFI, staged 2026-11-14, not yet run)
+
+`unlock50x_v1.c` now carries a build-flagged probe (`-DPCIE_GEN_EXPERIMENT`,
+enabled in `efi-unlock/build.sh`) that performs exactly that last write from EFI,
+pre-OS, where the card is not yet owned by the OS driver (the in-OS route is dead
+on this host: `nvidia` unbind/bind and `vfio-pci` bind all hang in D-state).
+
+How it works: the probe repoints the **second write pair** of the stock V67 ROP
+chain in `blobs/v67_payload.bin`, re-runs the booter (one run = one directed CSB
+write) and reads the target back through host MMIO and through PCI config space.
+
+Verified slot layout of the stock chain (word by word, 2026-11-14):
+
+| word | value | meaning |
+|---|---|---|
+| `0xF95C` | `0xFFFFFFFF` | write #1 value (FECS PLM = open) |
+| `0xF974` | `0x00409650` | write #1 address |
+| `0xF988` | `0x88888888` | write #2 value (FECS SS0 = full) |
+| `0xF9A4` | `0x00409664` | write #2 address |
+
+> **Correction.** Earlier notes (and the userspace `patch_tool.py` slot it ported)
+> named `{value@0xF948, addr@0xF960}`. Those words are a chain guard and a
+> continuation gadget — patching them corrupts the chain instead of writing a
+> register. That error was never exposed because the userspace run hung on the
+> `nvidia` unbind before the booter started. The probe refuses to run unless the
+> payload matches the table above (`GEN3-VERDICT: SLOT_LAYOUT_MISMATCH`).
+
+Probe sequence per card: `LINK_CAP2 = 0x0000000E` @ `0x880A4`, then
+`LINK_CAP.max_speed = 3` @ `0x88084`. No LTSSM kick and no FLR, so a rejected
+capability cannot disturb a trained link. Every run also re-reads `PLM`, which is
+the control: `PLM = 0xFFFFFFFF` proves the CSB write path itself worked, so a
+rejected capability register is real evidence and not a dead chain.
+
+Verdicts written to `\50hx_log.txt` on the ESP as `GEN3-VERDICT:` lines:
+
+- `WRITABLE_LATCH` — BAR0 accepted the write **and** config space advertises
+  Gen3 (`LINK_CAP2` bit 3). Gen3 becomes reachable in principle; continue with
+  policy + upstream retrain.
+- `ALIAS_ONLY` — BAR0 alias accepted it, config space still Gen2. Not usable.
+- `FUSE_CLAMPED` — both rejected: the seventh, final proof of the netlist fuse.
+- `SLOT_LAYOUT_MISMATCH` / `chain did not run` — no verdict, payload or chain
+  precondition failed; fix before drawing conclusions.
+
+Deployment is one-shot (`efibootmgr --bootnext`, entry created but not default),
+so the standard boot order and the kernel pin are untouched.
+
 The generation request defaults to Gen2.
 
 ## How to select the generation

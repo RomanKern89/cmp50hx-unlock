@@ -707,6 +707,9 @@ static UINTN     g_ourImageSize = 0; /* size of our loaded EFI binary, used by
                                       * when the path differs (issue #36) */
 static UINT32 g_Wpr2LoPreKill = 0;
 static UINT32 g_Wpr2HiPreKill = 0;
+/* step [9] records which booter loader worked, so the Gen3 probe re-runs the
+ * same one (both read the same V67 payload slot pair). */
+static BOOLEAN g_booterUsedV67 = FALSE;
 
 static EFI_STATUS
 pci_cfg_read(UINTN Reg, UINT32 *Out)
@@ -2766,231 +2769,161 @@ do_flr(void)
     return EFI_NOT_FOUND;
 }
 
-/* ==== PCIe gen unlock experiments (flag PCIE_GEN_EXPERIMENT) ====
- * Method verified on CMP 170HX/GA100 (cmp170hx-gen2): phase 1 publishes
- * capabilities GPU-side (XVE window, BAR0 base 0x88000), phase 2
- * retrains the link. Offsets cross-checked against upstream regmap
- * dev_nv_pcfg_xve_regmap.h. Retrain happens naturally when the link
- * comes back, so this runs strictly BEFORE any FLR; no MMIO after.
- * Stand finding: a LIVE GSP guards link regs and discards writes —
- * on real HW phase3 runs pre-OS, before any GSP exists.
- * Метод верифицирован на CMP 170HX/GA100 (luannanxian/cmp170hx-gen2,
- * upstream amoghmunikote/cmpunlocker ветка Gen2): фаза 1 — публикация
- * capability на GPU-стороне, фаза 2 — ретрейн. У них каждая запись шла
- * через перезапуск SEC2-ботера (у RM нет priv); у нас PLM уже открыт —
- * пишем напрямую в XVE-окно BAR0. Смещения сверены с официальной regmap:
- * open-gpu-kernel-modules ampere/ga102/dev_nv_pcfg_xve_regmap.h
- * (XVE-окно GA102 = база 0x88000; LINK_CAP@0x84, LC_STATUS@0x88 speed[19:16]
- * width[9:4], CAP2@0xA4, LC2@0xA8 target[3:0], PRIV_MISC_1@0x41C,
- * VSEC@0x60C/0x610, XVE_D0/D4/D8@0xFE8/EC/F0).
- * Ретрейн происходит сам при восстановлении линка после FLR — поэтому
- * стадия строго ДО FLR (BAR живой), пост-FLR MMIO не трогаем (уроки v2.87). */
+/* ==== PCIe Gen3 capability probe (flag PCIE_GEN_EXPERIMENT) ====
+ * Directed test only — this is NOT the shipped unlock path.
+ *
+ * Question: can the falcon-privileged SEC2 CSB write (the primitive the V67
+ * chain uses to land PLM/SS0) change the PCIe capability registers that the
+ * host BAR0 MMIO path rejects on TU102?
+ *   host MMIO, gate open:  LINK_CAP2 |= 0x8      -> readback 0x00000006
+ *                          LINK_CAP max_speed=3  -> readback 2
+ * The chain is left intact; only the SECOND write pair of the stock payload
+ * is repointed at the probe target, so write #1 (FECS PLM = open) still runs
+ * first and the gate context stays identical to production.
+ *
+ * Slot layout of blobs/v67_payload.bin (verified word by word, 2026-11-14):
+ *   0xF95C value 0xFFFFFFFF -> 0xF974 addr 0x00409650   (FECS PLM = open)
+ *   0xF988 value 0x88888888 -> 0xF9A4 addr 0x00409664   (FECS SS0 = full)
+ *   0xF9B8 value 0x00000000 -> post-lock write
+ * Each extra booter run performs exactly one directed CSB write. No LTSSM
+ * kick and no FLR, so a rejected capability cannot disturb a trained link.
+ * NOTE: earlier notes pointed at {value@0xF948, addr@0xF960}; those words are
+ * a chain guard and a continuation gadget, not a write pair — writing them
+ * corrupts the chain instead of probing a register. The real pair is below,
+ * and pcie_gen_probe() refuses to run if the payload does not match it. */
 #ifdef PCIE_GEN_EXPERIMENT
-#ifndef PCIE_GEN_TARGET
-#define PCIE_GEN_TARGET 3   /* 2=Gen2, 3=Gen3, 4=Gen4 — лестница тестов */
-#endif
+#define XVE_LINK_CAP          0x00088084u
+#define XVE_LINK_CTRL_STATUS  0x00088088u
+#define XVE_LINK_CAP2         0x000880a4u
+#define XVE_LINK_CTRL_2       0x000880a8u
 
-#define XVE_LINK_CAP         0x00088084u
-#define XVE_LINK_CTRL_STATUS 0x00088088u
-#define XVE_LINK_CAP2        0x000880a4u
-#define XVE_LINK_CTRL_2      0x000880a8u
-#define XVE_PRIV_MISC_1      0x0008841cu
-#define XVE_VSEC_DEVICE      0x0008860cu
-#define XVE_VSEC_HIERARCHY   0x00088610u
-#define XVE_LTSSM_OVR        0x0008872cu
-#define XVE_D0               0x00088fe8u
-#define XVE_D4               0x00088fecu
-#define XVE_D8               0x00088ff0u
+#define V67_SLOT2_VALUE       0x0000F988u
+#define V67_SLOT2_ADDR        0x0000F9A4u
+#define V67_SLOT2_STOCK_VALUE 0x88888888u
+#define V67_SLOT2_STOCK_ADDR  0x00409664u
 
-/* v2.93: priv-домены PCIe-блока. FEAT_OVR — РОДНОЕ семейство наших
- * PLM(0x823804)/SS0(0x82381C)/SS1(0x823820); у GA100 в этой же странице
- * сидит FEAT_OVR_ECC_PLM=0x00823800. OPT_* — fuse-shadow регистры
- * с битами поддерживаемых gen (имена из патча 0007 GA100).
- * XP3G — приватный домен PCIe IP (смещения GA100, регион валиден на
- * GA102 по regmap 0x8E000-0x8EFFC). */
-#define PCIE_FEAT_OVR_ECC    0x00823800u
-#define PCIE_OPT_MAGIC       0x00820520u
-#define PCIE_OPT_GEN23       0x0082057cu
-#define PCIE_OPT_GEN3        0x00820580u
-/* v2.95: OPTB — priv-домен страницы 0x82xxxx (у GA100: 10 регов D0..F4=FF) */
-#define PCIE_OPTB_BASE       0x008200d0u
-#define PCIE_OPTB_COUNT      10u
-/* v2.96: регистры из рабочего CMP90-патча (GA102, device 0x20B0):
- * FUSE_OVERRIDE — снятие fuse-лока PCIe gen (та же FEAT_OVR-страница,
- * что PLM/SS0/SS1!), LINK_CONTROL/LINK_SPEED — PL-блок как у GA100 */
-#define PCIE_FUSE_OVERRIDE   0x00823810u
-#define PCIE_LINK_CONTROL    0x0008c000u
-#define PCIE_LINK_SPEED_CFG  0x0008c040u
-#define PCIE_XP3G_PLM0       0x0008e1b0u
-#define PCIE_XP3G_OVR0       0x0008e110u
-#define PCIE_XP3G_VAL0       0x0008e120u
-#define PCIE_XP3G_OVR3       0x0008e11cu
-#define PCIE_XP3G_VAL3       0x0008e12cu
+static BOOLEAN s_gen3ProbeDone;
+static UINT32  s_pcieCapOff;   /* PCIe capability base in host config space */
 
-static int pcie_gen_fails;
+/* Host config-space view of Link Cap / Link Cap 2 — this is what the OS
+ * reports, as opposed to the BAR0 XVE alias. */
+static void
+pcie_gen_cfg_status(const CHAR16 *tag)
+{
+    UINT32 capPtr = cfg_read32(0x34) & 0xFF, hdr = 0, i = 0;
+
+    while (capPtr && capPtr < 0x100 && i++ < 48) {
+        hdr = cfg_read32(capPtr);
+        if ((hdr & 0xFF) == 0x10) break;
+        capPtr = (hdr >> 8) & 0xFF;
+    }
+    if (!capPtr || (hdr & 0xFF) != 0x10) {
+        Print(L"GEN3-PROBE cfg %s: PCIe capability not found\n", tag);
+        return;
+    }
+    s_pcieCapOff = capPtr;
+    Print(L"GEN3-PROBE cfg %s: LNKCAP(0x%02x)=0x%08x LNKCAP2(0x%02x)=0x%08x\n",
+          tag, capPtr + 0x0C, cfg_read32(capPtr + 0x0C),
+          capPtr + 0x2C, cfg_read32(capPtr + 0x2C));
+}
 
 static void
 pcie_gen_status(const CHAR16 *tag)
 {
     UINT32 st = mmio_read32(XVE_LINK_CTRL_STATUS);
-    Print(L"pcie-gen %s: LNKSTA=0x%08x speed=%d width=%d CAP=0x%08x CAP2=0x%08x LC2=0x%08x\n",
-          tag, st, (st >> 16) & 0xF, (st >> 4) & 0x3F,
+    Print(L"GEN3-PROBE %s: LNKSTA=0x%08x speed=%d width=%d CAP=0x%08x "
+          L"CAP2=0x%08x LC2=0x%08x PLM=0x%08x SS0=0x%08x\n",
+          tag, st, (INTN)((st >> 16) & 0xF), (INTN)((st >> 4) & 0x3F),
           mmio_read32(XVE_LINK_CAP), mmio_read32(XVE_LINK_CAP2),
-          mmio_read32(XVE_LINK_CTRL_2));
+          mmio_read32(XVE_LINK_CTRL_2),
+          mmio_read32(REG_FEAT_OVR_PLM), mmio_read32(REG_FEAT_OVR_SM_SPD));
+    pcie_gen_cfg_status(tag);
+}
+
+/* One directed write: repoint the chain's 2nd write pair, re-run the booter,
+ * read the target back through host MMIO. */
+static BOOLEAN
+pcie_gen_probe_write(UINT64 wprMetaPhys, UINT64 ucodePhys, UINT64 v67Phys,
+                     BOOLEAN useV67, UINT32 addr, UINT32 value,
+                     const CHAR16 *name)
+{
+    volatile UINT32 *pv = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_VALUE);
+    volatile UINT32 *pa = (volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_ADDR);
+    UINT32 pre = mmio_read32(addr), post;
+    EFI_STATUS s;
+
+    Print(L"GEN3-PROBE %s: target 0x%06x pre=0x%08x want=0x%08x\n",
+          name, addr, pre, value);
+    *pv = value;
+    *pa = addr;
+    __asm__ volatile("wbinvd" ::: "memory");
+    s = useV67 ? booter_load_v67(wprMetaPhys, ucodePhys)
+               : booter_load_tu102_direct(wprMetaPhys, ucodePhys);
+    uefi_call_wrapper(BS->Stall, 1, 200000);
+    post = mmio_read32(addr);
+    Print(L"GEN3-PROBE %s: run=%r post=0x%08x -> %s\n", name, s, post,
+          (post == value) ? L"WRITE_ACCEPTED" : L"WRITE_REJECTED");
+    pcie_gen_status(L"after");
+    /* always restore the stock pair: a poisoned payload would silently
+     * change every later run (and the unlock write #2) */
+    *pv = V67_SLOT2_STOCK_VALUE;
+    *pa = V67_SLOT2_STOCK_ADDR;
+    __asm__ volatile("wbinvd" ::: "memory");
+    return (post == value) ? TRUE : FALSE;
 }
 
 static void
-pcie_gen_wr_verify(UINTN off, UINT32 want, const CHAR16 *name)
+pcie_gen_probe(UINT64 wprMetaPhys, UINT64 ucodePhys, UINT64 v67Phys,
+               BOOLEAN useV67)
 {
-    UINT32 rd;
-    mmio_write32(off, want);
-    rd = mmio_read32(off);
-    if (rd != want) {
-        pcie_gen_fails++;
-        Print(L"pcie-gen: FAIL %s(0x%06x): want=0x%08x got=0x%08x\n",
-              name, off, want, rd);
-    } else {
-        Print(L"pcie-gen: ok %s=0x%08x\n", name, rd);
+    UINT32 stockV = *(volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_VALUE);
+    UINT32 stockA = *(volatile UINT32 *)(UINTN)(v67Phys + V67_SLOT2_ADDR);
+    UINT32 cap;
+    BOOLEAN cap2Ok, capOk;
+
+    Print(L"\n=== GEN3-PROBE: card %02x:%02x.%x, loader=%s ===\n",
+          (INTN)gBus, (INTN)gDev, (INTN)gFn, useV67 ? L"v67" : L"direct");
+    /* negative control: if the payload is not the stock V67 chain the slot
+     * offsets mean nothing — refuse instead of writing into random words */
+    if (stockV != V67_SLOT2_STOCK_VALUE || stockA != V67_SLOT2_STOCK_ADDR) {
+        Print(L"GEN3-VERDICT: SLOT_LAYOUT_MISMATCH value=0x%08x addr=0x%08x "
+              L"— probe aborted\n", stockV, stockA);
+        return;
     }
-}
+    pcie_gen_status(L"pre");
 
-static void
-pcie_gen_unlock_debug(UINT64 wprMetaPhys, UINT64 ucodePhys, UINT64 v67Phys)
-{
-    UINT32 v;
-    EFI_STATUS st;
+    cap2Ok = pcie_gen_probe_write(wprMetaPhys, ucodePhys, v67Phys, useV67,
+                                  XVE_LINK_CAP2, 0x0000000Eu, L"LINK_CAP2=0x0e");
+    cap = mmio_read32(XVE_LINK_CAP);
+    capOk = pcie_gen_probe_write(wprMetaPhys, ucodePhys, v67Phys, useV67,
+                                 XVE_LINK_CAP, (cap & ~0xFu) | 3u, L"LINK_CAP.ms=3");
 
-    Print(L"\n=== pcie-gen: PCIe Gen%d unlock (v2.97 booter-write) ===\n",
-          PCIE_GEN_TARGET);
-    pcie_gen_fails = 0;
-    pcie_gen_status(L"pre ");
-
-    /* Шаг 0 (v2.97): снятие fuse-лока ЧЕРЕЗ БОТЕР (falcon priv, как
-     * kgspCmp90RefillPayload у драйвера): патчим {value@0xf948,
-     * addr@0xf960} в копии V67-payload в ОЗУ и гоним второй прогон ботера.
-     * booter_load_v67 сам делает полный ресет SEC2 на входе. */
-    if (v67Phys && ucodePhys) {
-        volatile UINT32 *pv = (volatile UINT32 *)(UINTN)(v67Phys + 0xf948);
-        volatile UINT32 *pa = (volatile UINT32 *)(UINTN)(v67Phys + 0xf960);
-        Print(L"pcie-gen: v97: payload value@0xf948=0x%08x addr@0xf960=0x%08x\n",
-              *pv, *pa);
-        *pv = 0x00000000u;
-        *pa = PCIE_FUSE_OVERRIDE;
-        Print(L"pcie-gen: booter#2 (PCIE_FUSE=0)...\n");
-        st = booter_load_v67(wprMetaPhys, ucodePhys);
-        Print(L"pcie-gen: booter#2: %r, FUSE_OVR=0x%08x (want 0)\n",
-              st, mmio_read32(PCIE_FUSE_OVERRIDE));
-    } else {
-        Print(L"pcie-gen: v97: no payload context - booter write skipped\n");
-    }
-
-    /* v2.93: дамп fuse-shadow страницы FEAT_OVR/OPT (родня PLM/SS0/SS1).
-     * OPT_MAGIC должен показать сигнатуру, если OPT-space живёт тут же. */
-    Print(L"pcie-gen: FEAT_OVR[0x823800..04]=0x%08x/0x%08x  SS0=0x%08x SS1=0x%08x\n",
-          mmio_read32(PCIE_FEAT_OVR_ECC), mmio_read32(REG_FEAT_OVR_PLM),
-          mmio_read32(REG_FEAT_OVR_SM_SPD), mmio_read32(REG_FEAT_OVR_SM_SPD_1));
-    Print(L"pcie-gen: OPT_MAGIC(0x820520)=0x%08x GEN23(0x82057c)=0x%08x GEN3(0x820580)=0x%08x\n",
-          mmio_read32(PCIE_OPT_MAGIC), mmio_read32(PCIE_OPT_GEN23),
-          mmio_read32(PCIE_OPT_GEN3));
-
-    /* Шаг 1 (v2.95): OPTB priv-домен страницы 0x82xxxx — как у GA100,
-     * 10 регистров 0x8200D0..F4 = FF. Открывает OPT/fuse-shadow записи. */
+    Print(L"GEN3-VERDICT: CAP2=0x%08x (gen3 bit %s) CAP=0x%08x (max_speed=%d, "
+          L"gen3 %s)\n",
+          mmio_read32(XVE_LINK_CAP2), cap2Ok ? L"ACCEPTED" : L"REJECTED",
+          mmio_read32(XVE_LINK_CAP),
+          (INTN)(mmio_read32(XVE_LINK_CAP) & 0xFu),
+          capOk ? L"ACCEPTED" : L"REJECTED");
     {
-        UINTN i;
-        for (i = 0; i < PCIE_OPTB_COUNT; i++)
-            pcie_gen_wr_verify(PCIE_OPTB_BASE + i * 4, 0xFFFFFFFFu, L"OPTB");
+        UINT32 cfgCap2 = s_pcieCapOff ? cfg_read32(s_pcieCapOff + 0x2C) : 0;
+        UINT32 cfgCap  = s_pcieCapOff ? cfg_read32(s_pcieCapOff + 0x0C) : 0;
+        BOOLEAN cfgGen3 = (cfgCap2 & 0x8u) ? TRUE : FALSE;
+
+        Print(L"GEN3-VERDICT: cfgCAP2=0x%08x cfgCAP=0x%08x (OS-visible view)\n",
+              s_pcieCapOff ? cfgCap2 : 0xFFFFFFFFu,
+              s_pcieCapOff ? cfgCap : 0xFFFFFFFFu);
+        if (!s_pcieCapOff)
+            Print(L"GEN3-VERDICT: CONFIG_SPACE_UNAVAILABLE — verdict is BAR0-only\n");
+        else if ((cap2Ok || capOk) && cfgGen3)
+            Print(L"GEN3-VERDICT: WRITABLE_LATCH — CSB capability write landed "
+                  L"and config space advertises Gen3; Gen3 reachable in principle\n");
+        else if (cap2Ok || capOk)
+            Print(L"GEN3-VERDICT: ALIAS_ONLY — BAR0 accepted the write but config "
+                  L"space still does not advertise Gen3\n");
+        else
+            Print(L"GEN3-VERDICT: FUSE_CLAMPED — 7th proof, Gen3 impossible on "
+                  L"this SKU\n");
     }
-    /* Шаг 1b: FEAT_OVR ECC-страница + XP3G PCIe IP (v2.93, ретрай) */
-    pcie_gen_wr_verify(PCIE_FEAT_OVR_ECC, 0xFFFFFFFFu, L"FEAT_OVR_ECC");
-    {
-        int i;
-        for (i = 0; i < 4; i++)
-            pcie_gen_wr_verify(PCIE_XP3G_PLM0 + i * 4, 0xFFFFFFFFu, L"XP3G_PLM");
-    }
-    /* XP3G overrides как у GA100: OVR0=1/VAL0=0, OVR3=4/VAL3=0x00200000 */
-    pcie_gen_wr_verify(PCIE_XP3G_VAL0, 0x00000000u, L"XP3G_VAL0");
-    pcie_gen_wr_verify(PCIE_XP3G_OVR0, 0x00000001u, L"XP3G_OVR0");
-    pcie_gen_wr_verify(PCIE_XP3G_VAL3, 0x00200000u, L"XP3G_VAL3");
-    pcie_gen_wr_verify(PCIE_XP3G_OVR3, 0x00000004u, L"XP3G_OVR3");
-
-    /* Шаг 2 (v2.95): OPT-биты gen — GA100 клал GEN23=0; пробуем и GEN3=0.
-     * Это fuse-shadow — та же семья, что SS0/SS1, может принять запись. */
-    pcie_gen_wr_verify(PCIE_OPT_GEN23, 0x00000000u, L"OPT_GEN23");
-    pcie_gen_wr_verify(PCIE_OPT_GEN3, 0x00000000u, L"OPT_GEN3");
-
-    /* Шаг 2: priv-домены XVE (как у GA100: XVE_D0/D4/D8 = FF) — повторно,
-     * уже после открытия доменов шага 1 */
-    mmio_write32(XVE_D0, 0xFFFFFFFFu);
-    mmio_write32(XVE_D4, 0xFFFFFFFFu);
-    mmio_write32(XVE_D8, 0xFFFFFFFFu);
-    Print(L"pcie-gen: XVE_D0/D4/D8 = 0x%x/0x%x/0x%x\n",
-          mmio_read32(XVE_D0), mmio_read32(XVE_D4), mmio_read32(XVE_D8));
-
-    /* PRIV_MISC_1: set bits(11|13), clear bits(12|14) — семантика GA100 */
-    v = mmio_read32(XVE_PRIV_MISC_1);
-    pcie_gen_wr_verify(XVE_PRIV_MISC_1,
-                       (v | (1u << 11) | (1u << 13)) & ~((1u << 12) | (1u << 14)),
-                       L"PRIV_MISC_1");
-
-    /* VSEC_HIERARCHY: clear bit12, set bit0 */
-    v = mmio_read32(XVE_VSEC_HIERARCHY);
-    pcie_gen_wr_verify(XVE_VSEC_HIERARCHY, (v & ~(1u << 12)) | 1u,
-                       L"VSEC_HIERARCHY");
-
-    /* VSEC_DEVICE: set bit0 */
-    v = mmio_read32(XVE_VSEC_DEVICE);
-    pcie_gen_wr_verify(XVE_VSEC_DEVICE, v | 1u, L"VSEC_DEVICE");
-
-    /* LINK_CAP: MAX_LINK_SPEED[3:0] = target */
-    v = mmio_read32(XVE_LINK_CAP);
-    pcie_gen_wr_verify(XVE_LINK_CAP, (v & ~0xFu) | PCIE_GEN_TARGET, L"LINK_CAP");
-
-    /* LINK_CAP2: как GA100 0x2→0x6 (set bits 1|2) */
-    v = mmio_read32(XVE_LINK_CAP2);
-    pcie_gen_wr_verify(XVE_LINK_CAP2, v | 0x6u, L"LINK_CAP2");
-
-    /* LINK_CTRL_2: TARGET_LINK_SPEED = target + биты [19:16]=F как у GA100 */
-    v = mmio_read32(XVE_LINK_CTRL_2);
-    pcie_gen_wr_verify(XVE_LINK_CTRL_2,
-                       (v & ~0xFu) | PCIE_GEN_TARGET | 0x000F0000u,
-                       L"LINK_CTRL_2");
-
-    /* Шаг 2b (v2.96): ГЛАВНАЯ ПРОБА — регистры из рабочего CMP90-патча.
-     * FUSE_OVERRIDE=0 снимает fuse-лок gen; LINK_CONTROL=target выбирает
-     * скорость. Оба пишутся хостом ПОСЛЕ открытия PLM (у нас он открыт). */
-    pcie_gen_wr_verify(PCIE_FUSE_OVERRIDE, 0x00000000u, L"PCIE_FUSE_OVR");
-    pcie_gen_wr_verify(PCIE_LINK_CONTROL, (UINT32)PCIE_GEN_TARGET,
-                       L"LINK_CONTROL");
-    Print(L"pcie-gen: LINK_SPEED_CFG(0x8c040)=0x%08x\n",
-          mmio_read32(PCIE_LINK_SPEED_CFG));
-
-    /* Шаг 3 (v2.95): фолбэк — запись Link Cap через ХОСТОВОЕ конфиг-
-     * пространство. XVE-зеркало шарит смещения с cfg (Link Cap = pcie_cap
-     * +0x0C); вдруг cfg-запись хоста обслуживается минуя MMIO-гейт. */
-    {
-        UINT32 capPtr = cfg_read32(0x34) & 0xFF, lnkcapOff = 0, cur;
-        while (capPtr && capPtr < 0x100) {
-            UINT32 hdr = cfg_read32(capPtr);
-            if ((hdr & 0xFF) == 0x10) { lnkcapOff = capPtr + 0x0C; break; }
-            capPtr = (hdr >> 8) & 0xFF;
-        }
-        if (lnkcapOff) {
-            cur = cfg_read32(lnkcapOff);
-            Print(L"pcie-gen: host-cfg LNKCAP(0x%02x)=0x%08x\n", lnkcapOff, cur);
-            cfg_write32(lnkcapOff, (cur & ~0xFu) | PCIE_GEN_TARGET);
-            Print(L"pcie-gen: host-cfg LNKCAP post=0x%08x (want max_speed=%d)\n",
-                  cfg_read32(lnkcapOff), PCIE_GEN_TARGET);
-        } else {
-            Print(L"pcie-gen: host-cfg: PCIe capability not found\n");
-        }
-    }
-
-    Print(L"pcie-gen: LTSSM_OVR(0x8872c)=0x%08x (read-only)\n",
-          mmio_read32(XVE_LTSSM_OVR));
-
-    pcie_gen_status(L"post");
-    Print(L"pcie-gen: done, fail=%d (retrain - on link recovery after FLR)\n",
-          pcie_gen_fails);
 }
 #endif /* PCIE_GEN_EXPERIMENT */
 
@@ -4914,15 +4847,33 @@ u50_unlock_card(EFI_HANDLE ImageHandle)
     Print(L"[50HX] booter_load_tu102_direct (ports, BOOTVEC=0, RM=0x162000A1)...\n");
     Status = booter_load_tu102_direct(wprMetaPhys, ucodePhys);
     Print(L"[50HX] booter_load_tu102_direct returned %r\n", Status);
+    g_booterUsedV67 = FALSE;
     if (EFI_ERROR(Status)) {
         /* v56 fallback：GA102 风格 DMA path（v55 用的那套），结果对比用 */
         Print(L"[50HX] fallback: booter_load_v67 (DMA path, GA102-style)...\n");
         Status = booter_load_v67(wprMetaPhys, ucodePhys);
+        g_booterUsedV67 = TRUE;
         Print(L"[50HX] booter_load_v67 returned %r\n", Status);
     }
     sec2_health(L"v55-post-booter");
     uefi_call_wrapper(BS->Stall, 1, 500000);
     dump_regs(L"[v55 post-booter]");
+
+    /* ---------- [9b] PCIe Gen3 capability probe (dev build only) ----------
+     * Runs once, on the first card, only when the chain demonstrably executed
+     * (PLM read back open). Each probe = one patched payload + one extra booter
+     * run; the target register is read back through host MMIO. */
+#ifdef PCIE_GEN_EXPERIMENT
+    if (!s_gen3ProbeDone) {
+        s_gen3ProbeDone = TRUE;
+        if (v67Phys && mmio_read32(REG_FEAT_OVR_PLM) == VAL_PLM_OPEN) {
+            pcie_gen_probe(wprMetaPhys, ucodePhys, v67Phys, g_booterUsedV67);
+        } else {
+            Print(L"GEN3-PROBE: skipped (status=%r PLM=0x%08x) — chain did not run\n",
+                  Status, mmio_read32(REG_FEAT_OVR_PLM));
+        }
+    }
+#endif
 
     /* ---------- [10] 判定 + cleanup ---------- */
     {

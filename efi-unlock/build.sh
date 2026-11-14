@@ -29,6 +29,7 @@ gcc -c -O2 -fno-stack-protector -fpic -ffreestanding \
     -fno-builtin -fno-strict-aliasing -Wno-unused-function \
     -I "$EFI_INC" -I "$EFI_INC/x86_64" \
     -DGNU_EFI_USE_MS_ABI -DDIRECT_SEC2 -DRELEASE_BUILD -DVBIOS_DUMP \
+    -DPCIE_GEN_EXPERIMENT \
     -o "$OBJ" "$SRC"
 
 echo "=== 2. embed blobs ==="
