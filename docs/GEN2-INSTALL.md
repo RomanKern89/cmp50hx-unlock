@@ -26,13 +26,6 @@ patched modules **for the running kernel**, installs them with a backup of the
 old ones, and bakes them into the initramfs. It never reboots or unloads a live
 driver. Wait for `PASS_CMP50HX_INSTALL`.
 
-> Until the PLX-Gen2 fix is merged to `master`, install from the branch that has
-> it by prefixing the command with its tarball URL:
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/RomanKern89/cmp50hx-unlock/feat/pcie-gen3-adaptive/install.sh \
->   | sudo CMP_UNLOCK_REPO_TARBALL=https://github.com/RomanKern89/cmp50hx-unlock/archive/refs/heads/feat/pcie-gen3-adaptive.tar.gz bash
-> ```
-
 ## Step 2 — reboot
 
 ```bash
@@ -55,6 +48,37 @@ sudo dmesg | grep CMP50_GEN2                                   # UPSTREAM_RETRAI
 Expected: `pcie.link.gen.current = 2`, `current_link_speed = 5.0 GT/s`,
 `dmesg` shows `CMP50_GEN2: UPSTREAM_RETRAIN ... cur_speed=2` and
 `RETRAIN_PASS`, and no `Xid`/`AER` errors.
+
+## Tested on
+
+Verified live on the hardest topology — a card **behind a PLX switch**, where Gen2
+used to be impossible:
+
+- **Board:** ASUS X99-E WS (Intel X99). Both CMP 50HX sit **behind cascaded PLX
+  PEX8747 switches** (card → PEX8747 → PEX8747 → CPU root port), not on a
+  CPU-direct slot.
+- **GPUs:** GPU0 `05:00.0` (x16) and GPU1 `0a:00.0` (x8), both `10de:1e09`.
+- **OS:** Ubuntu, kernel `7.0.0-42-generic`; NVIDIA driver `610.43.03`.
+- **Result (measured):** both cards `current_link_speed = 5.0 GT/s`,
+  `pcie.link.gen.current = 2`, **0 Xid / 0 AER**, stable under continuous load.
+  `dmesg` shows `CMP50_GEN2: UPSTREAM_RETRAIN ... cur_speed=2 attempt=0` followed by
+  `ALREADY_GEN2 ... (not re-kicking)`.
+
+## How it works (why Gen2 sticks behind a PLX)
+
+On PLX boards earlier attempts lost Gen2 because the **signed GSP firmware reverts**
+the link capability back to Gen1 shortly after the driver raises it. The fix acts in
+the **post-booter window** — after the SEC2 booter runs but **before GSP-RM loads**:
+
+1. it adopts the higher (Gen2) link capability on the card, and
+2. **retrains the card's immediate upstream link (the PLX port) to Gen2 right there**,
+   so the link is already physically trained to Gen2 before GSP comes up.
+
+GSP does not fight a link that is already trained — it leaves the Gen2 link alone, so
+Gen2 survives into the OS. (An OS-side retrain alone was too late: GSP had already
+reverted and re-locked.) That is what makes Gen2 work behind the dual-PEX8747
+topology of the X99-E WS. The code is the post-booter hook in
+`patches/cmp50hx/01-cmp50-stockflow.patch` (`s_cmp50RetrainUpstreamGen2`).
 
 ## Important: kernel updates
 

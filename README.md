@@ -109,12 +109,13 @@ sudo reboot
   unlock is now generation-adaptive and **requests Gen3 by default**, retraining
   only as high as each card actually adopts (so it can never ask for a speed the
   card does not advertise); set `cmp50_target_gen=2` / `CMP50_TARGET_GEN=2` to
-  force the proven Gen2 path. See [docs/PCIE-GEN3.md](docs/PCIE-GEN3.md). Gen3 on
-  a physical card is not yet hardware-confirmed, and behind a PLX switch (as on
-  the X99-E WS, where every x16 slot sits behind a PEX8747) the card comes up
-  Gen1 regardless — a board limit, measured in
-  [userspace-unlock/BIOS-SETUP.md](userspace-unlock/BIOS-SETUP.md). The link
-  speed bounds only host↔GPU transfers; the compute unlock is unaffected.
+  force the proven Gen2 path. **Gen2 now sticks even behind a PLX switch**
+  (confirmed on an ASUS X99-E WS, where every x16 slot sits behind a PEX8747 —
+  this used to come up Gen1); setup in [docs/GEN2-INSTALL.md](docs/GEN2-INSTALL.md).
+  **Gen3 is fuse-clamped on the TU102 silicon** — the card refuses the Gen3
+  capability bit even from a privileged write, so Gen2 is the hardware ceiling;
+  evidence in [docs/PCIE-GEN3.md](docs/PCIE-GEN3.md). The link speed bounds only
+  host↔GPU transfers; the compute unlock is unaffected.
 * **ReBAR / RT core count.** Separate patches exist in `patches/` and are
   documented in the upstream README; they are not part of the compute unlock.
 
@@ -149,6 +150,6 @@ own terms.
 * Основной путь — патченный драйвер `610.43.03`: `sudo ./install.sh --card cmp50hx`, затем перезагрузка. Нужен выключенный Secure Boot либо зачисленный MOK-ключ.
 * Альтернатива для хостов, где модуль загрузить нельзя — `userspace-unlock/`: анлок из userspace до загрузки драйвера (vfio + hugepages). Механизм доказан, но стоковый драйвер перезаписывает селекторы — подробности и все отрицательные результаты в `userspace-unlock/RESULTS.md`.
 * Для карт на 20 ГБ обязателен `--fb 20g`.
-* PCIe Gen2 на платах с PLX-коммутатором недостижим — это ограничение платы, на вычисления не влияет.
+* PCIe Gen2 теперь работает **и на платах с PLX-коммутатором** (ASUS X99-E WS с PEX8747): патченный модуль ретрейнит upstream-линк карты к Gen2 в post-booter окне до загрузки GSP. Настройка — [docs/GEN2-INSTALL.md](docs/GEN2-INSTALL.md). Gen3 упирается в фьюз кремния TU102 (потолок — Gen2), подробности — [docs/PCIE-GEN3.md](docs/PCIE-GEN3.md).
 
 Подробная инструкция: [INSTALL.md](INSTALL.md).
