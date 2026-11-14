@@ -1,4 +1,4 @@
-# CMP 50HX unlock — full FP32 and INT8 speed on the NVIDIA CMP 50HX (TU102)
+# CMP 50HX unlock — full FP32/INT8 compute speed and PCIe Gen2 on the NVIDIA CMP 50HX (TU102)
 
 [Русская версия ниже](#кратко-по-русски) · [Detailed install guide](INSTALL.md) · [Measured results](userspace-unlock/RESULTS.md)
 
@@ -8,6 +8,11 @@ the silicon can do. This repository restores both, at every boot, on a normal
 Linux system — and, for hosts where a driver-side patch cannot be loaded,
 contains a **userspace** unlock that performs the same privileged register write
 from before the driver binds the card.
+
+It also unlocks **PCIe Gen2** (5.0 GT/s) on the CMP 50HX — including boards where
+the card sits **behind a PLX switch** (e.g. ASUS X99-E WS with PEX8747), where Gen2
+was previously impossible. The patched module retrains the card's upstream link to
+Gen2 before GSP comes up, so it sticks; see [docs/GEN2-INSTALL.md](docs/GEN2-INSTALL.md).
 
 Everything here was verified on real hardware: two CMP 50HX with 20 GiB
 (memory-modified), Ubuntu 26.04, kernel 7.0.0-42, driver 610.43.03.
