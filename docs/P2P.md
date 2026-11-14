@@ -41,3 +41,33 @@ Notes:
 
 Full thread with lspci/ReBAR output and numbers:
 https://github.com/xrip/cmp50hx-unlock/issues/14
+### Measured on lmserver, 2026-11-14 (CUDA benchmark — the gap this doc flagged)
+
+First actual CUDA transfer measurement of the pair (kernel `7.0.0-43-generic`,
+driver 610.43.03, both cards at Gen2, 256 MiB buffers, 20 iterations, best of
+run, mining active):
+
+| path | bandwidth |
+|---|---|
+| `cudaMemcpyPeer` GPU0 -> GPU1 | **0.42 GB/s** |
+| `cudaMemcpyPeer` GPU1 -> GPU0 | **0.40 GB/s** |
+| staged via host (D2H + H2D) | **4.57 GB/s** |
+
+`nvidia-smi topo -p2p r` reports `OK` and `cudaDeviceCanAccessPeer` returns 1 in
+both directions, so peer access is *functional* — but it is an order of
+magnitude slower than staging through the host, i.e. the direct path is not in
+use. The cause is visible in the topology and the ACS state:
+
+- the two cards are on **different** PEX8747 switches
+  (`00:03.0 -> 03:00.0 -> 04:10.0 -> 05:00.0` and
+  `00:02.0 -> 07:00.0 -> 08:11.0 -> 0a:00.0`), so peer traffic has to cross the
+  root complex instead of staying inside one switch;
+- every PLX downstream port still advertises
+  `ACSCtl: SrcValid+ TransBlk- ReqRedir+ CmpltRedir+ UpstreamFwd+`, and the boot
+  line carries **none** of the recipe above (`intel_iommu=on iommu=pt`,
+  `pci=realloc,hpmemsize=...`, `disable_acs_redir=<ports>`).
+
+So on this host P2P is currently slower than host staging and should not be
+used. To revisit: apply the boot recipe to the ports in the chains listed here,
+re-run this measurement, and only then decide. Same-switch P2P (both cards
+behind one PEX8747) is the configuration where the switch shortcut pays off.
