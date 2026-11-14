@@ -90,15 +90,45 @@ supports Gen3 (it is the RTX 2080 Ti chip), but NVIDIA fused this CMP 50HX SKU's
 PCIe link capability to Gen2, and that clamp resists every write path available,
 including the privileged one that unlocks Gen2. **Gen2 is the hardware ceiling.**
 
-The only theoretically remaining avenue is a signed-booter ROP that overrides a
-PCIe-generation fuse before GSP regenerates the config block — the analogue of
-how the compute unlock overrides the SM-speed fuses (`0x409664`/`0x40966c`). That
-is unproven: no writable PCIe-gen fuse has been located in the TU102 GSP/booter
-RE, the project's own `PCIE_GEN_EXPERIMENT` booter-fuse attempt
-(`efi-unlock/unlock50x_v1.c`) ran pre-OS where the gate is closed and was never
-validated, and the fuse may simply not be booter-overridable the way the SM-speed
-fuse is. Pursuing it is a weeks-scale reverse-engineering effort on the scale of
-the original unlock, with no guarantee of success.
+### No software override exists on TU102 (source audit, 2026-11-14)
+
+A pass over the published `610.43.03` `open-gpu-kernel-modules` source confirms the
+clamp sits below any software-reachable register on Turing:
+
+- The driver's only PCIe-generation *force* knob is **Gen2** (`RmForceEnableGen2` →
+  `PDB_PROP_CL_PCIE_FORCE_GEN2_ENABLE`, `chipset.c`). There is **no**
+  `ForceEnableGen3` / `FORCE_GEN3` anywhere in the tree — NVIDIA's own RM never
+  forces Gen3 on this family.
+- There is **no `dev_nv_xp.h` for `turing/tu102`** at all. The XP/PL block — where
+  `LINK_CONFIG_0 0x8c040`, `PL_LINK_RATE 0x8c1c0`, the CYA controls and the
+  supported-speeds logic live — is published for Pascal/Maxwell/NVSwitch, but the
+  Turing XP3G block is closed. The ceiling is enforced in an unpublished,
+  PLM-locked hardware block.
+- No `SUPPORTED_LINK_SPEEDS_VECTOR`, `OPT_PCIE_GEN`, or PCIe-gen fuse-override
+  register is defined for **any** chip in the published regmaps. The Ampere
+  `OPT_GEN23`/`OPT_GEN3` names used by the EFI experiment came from a community
+  CMP 170HX/90HX patch, not NVIDIA headers, and read `0`/poison on TU102.
+- A prior full IDA pass over `gsp_tu10x_610.43.03.elf` already found the GSP PCIe
+  policy routine `RMPcieLinkSpeed @0x4cb25b8` writes only those policy registers
+  and **never writes Link Cap/Cap2 nor reads a PCIe-gen fuse** — re-disassembling
+  the GSP cannot locate a fuse the firmware does not read.
+
+Five independent lines now agree the TU102 PCIe link is fused to Gen2 below the
+software layer: (1) the direct privileged XVE write of the Gen3 capability bits is
+rejected; (2) the policy-driven LTSSM regen clamps the regenerated `LNKCAP2` to
+Gen2; (3) the GSP firmware does not touch the ceiling; (4) the published source
+exposes no Gen3 force path and no supported-speeds / fuse-override register on
+Turing; (5) the driver's own maximum force is Gen2.
+
+The one write not yet tried is the same `LINK_CAP`/`LINK_CAP2` write routed through
+the **falcon-privileged SEC2 booter CSB** (the primitive that lands the SM-speed
+override, `efi-unlock/unlock50x_v1.c` `own_code_67`) instead of the MMIO window.
+It is a *directed* test — known target (`0x88084`/`0x880a4`), known value (Gen3
+bits) — but low odds: `LINK_CAP2` is a capability register driven combinationally
+from the supported-speeds vector, so a falcon-priv write to its alias is unlikely
+to differ from the already-rejected MMIO write, and no writable latch for it exists
+in any regmap. **Gen2 remains the hardware ceiling; Gen3 is not reachable by any
+validated or principled path.**
 
 The generation request defaults to Gen2.
 
