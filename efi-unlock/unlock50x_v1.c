@@ -2940,12 +2940,46 @@ ptop_write_probe(void)
           (rb == (cfg ^ 0x00010000u)) ? L"WRITABLE" : L"READ_ONLY");
 }
 
+/* Track F step 1, read-only: the whole fuse/feature readback window, 16 words
+ * per line, as seen from the pre-OS booter window (the only window where the
+ * shadow is not gated — in the OS the same words read 0 or 0xbadf5040). */
+#define FUSE_WINDOW_START 0x00021000u
+#define FUSE_WINDOW_END   0x00022000u
+static void
+fuse_window_dump(const CHAR16 *tag)
+{
+    UINT32 base, i, v, nz = 0, poison = 0;
+
+    Print(L"FUSE-DUMP %s: window 0x%05x..0x%05x, 16 words/line\n",
+          tag, FUSE_WINDOW_START, FUSE_WINDOW_END);
+    for (base = FUSE_WINDOW_START; base < FUSE_WINDOW_END; base += 0x40u) {
+        BOOLEAN any = FALSE;
+        for (i = 0; i < 16; i++) {
+            v = mmio_read32(base + 4u * i);
+            if (v) any = TRUE;
+            if (v == 0xBADF5040u) poison++;
+            else if (v) nz++;
+        }
+        if (!any)
+            continue;
+        Print(L"FUSE-DUMP %05x:", base);
+        for (i = 0; i < 16; i += 4)
+            Print(L" %08x %08x %08x %08x",
+                  mmio_read32(base + 4u * i),
+                  mmio_read32(base + 4u * (i + 1)),
+                  mmio_read32(base + 4u * (i + 2)),
+                  mmio_read32(base + 4u * (i + 3)));
+        Print(L"\n");
+    }
+    Print(L"FUSE-DUMP %s: non-zero-non-poison=%d poison=%d\n", tag, (INTN)nz,
+          (INTN)poison);
+}
+
 static void
 pcie_gen_status(const CHAR16 *tag)
 {
     UINT32 st = mmio_read32(XVE_LINK_CTRL_STATUS);
-    fuse_ptop_status(tag);
-    Print(L"GEN3-PROBE %s: LNKSTA=0x%08x speed=%d width=%d CAP=0x%08x "
+    fuse_ptop_status(tag);    Print(L"GEN3-PROBE %s: LNKSTA=0x%08x speed=%d width=%d CAP=0x%08x "
           L"CAP2=0x%08x LC2=0x%08x XP3G=0x%08x PLM=0x%08x SS0=0x%08x SS1=0x%08x\n",
           tag, st, (INTN)((st >> 16) & 0xF), (INTN)((st >> 4) & 0x3F),
           mmio_read32(XVE_LINK_CAP), mmio_read32(XVE_LINK_CAP2),
@@ -2969,6 +3003,15 @@ pcie_gen_probe_pre(UINT64 v67Phys)
     Print(L"\n=== GEN3-PROBE card %02x:%02x.%x exp{#1=0x%06x #2=0x%06x} ===\n",
           (INTN)gBus, (INTN)gDev, (INTN)gFn,
           (UINT32)GEN3_SLOT1_ADDR, (UINT32)GEN3_SLOT2_ADDR);
+#ifdef GEN3_READONLY
+    /* Read-only build (Track F dump): nothing is armed and no register is
+     * written by the probe. The application's normal booter pass still runs —
+     * that is its shipped pre-OS behaviour, identical to every other boot. */
+    Print(L"GEN3-PROBE: READ-ONLY build — dumps only, slots not armed\n");
+    fuse_ptop_status(L"pre");
+    fuse_window_dump(L"pre");
+    return;
+#endif
     /* negative control: the slot offsets only mean something on the stock chain */
     if (v1 != V67_SLOT1_STOCK_VALUE || a1 != V67_SLOT1_STOCK_ADDR ||
         v2 != V67_SLOT2_STOCK_VALUE || a2 != V67_SLOT2_STOCK_ADDR) {
