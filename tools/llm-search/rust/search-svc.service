@@ -1,0 +1,43 @@
+[Unit]
+Description=LLM Search & Fetch service (Rust)
+Documentation=file:/data/search-svc-rust/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=searchsvc
+Group=searchsvc
+WorkingDirectory=/data/search-svc-rust
+EnvironmentFile=/data/search-svc-rust/search.env
+ExecStart=/data/search-svc-rust/search-svc
+Restart=always
+RestartSec=3
+
+# Hardening: no privileges, read-only filesystem, no writable paths at all
+# (the Rust build keeps its cache in RAM).
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Resource caps: IO/network bound, not CPU bound.
+MemoryMax=384M
+CPUQuota=200%
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

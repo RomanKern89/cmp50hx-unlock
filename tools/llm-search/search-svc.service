@@ -1,0 +1,41 @@
+[Unit]
+Description=LLM Search & Fetch service (safe web tools for local models)
+Documentation=file:/data/search-svc/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=searchsvc
+Group=searchsvc
+WorkingDirectory=/data/search-svc
+EnvironmentFile=/data/search-svc/search.env
+ExecStart=/data/search-svc/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8099 --workers 1 --log-level info --no-access-log
+Restart=always
+RestartSec=3
+
+# Hardening: no privileges, read-only filesystem except the cache dir.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadWritePaths=/data/search-svc/data
+
+# Resource caps: the service is IO/network bound, not CPU bound.
+MemoryMax=512M
+CPUQuota=150%
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
