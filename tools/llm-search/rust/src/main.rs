@@ -71,6 +71,7 @@ pub struct Config {
     pub cache_max_bytes: usize,
     pub fetch_ttl: u64,
     pub search_ttl: u64,
+    pub ddg_cooldown: Duration,
     pub searx_url: String,
     pub rate_per_min: usize,
     pub fetch_concurrency: usize,
@@ -96,6 +97,7 @@ impl Config {
             cache_max_bytes: env_usize("SEARCH_CACHE_MB", 64) * 1024 * 1024,
             fetch_ttl: env_u64("SEARCH_FETCH_TTL", 6 * 3600),
             search_ttl: env_u64("SEARCH_TTL", 600),
+            ddg_cooldown: Duration::from_secs(env_u64("SEARCH_DDG_COOLDOWN", 300)),
             searx_url: env_str("SEARCH_SEARX_URL", "")
                 .trim()
                 .trim_end_matches('/')
@@ -115,6 +117,7 @@ pub struct AppState {
     pub sem: tokio::sync::Semaphore,
     pub rate: Mutex<VecDeque<Instant>>,
     pub ddg_warm: Mutex<Option<Instant>>,
+    pub ddg_down_until: Mutex<Option<Instant>>,
     pub started: Instant,
 }
 
@@ -231,6 +234,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "uptime_s": state.started.elapsed().as_secs(),
         "auth_required": !state.cfg.token.is_empty(),
         "searx": !state.cfg.searx_url.is_empty(),
+        "ddg_ready": !search::ddg_cooling_down(&state),
         "cache": {
             "entries": entries,
             "mb": ((bytes as f64) / 1048576.0 * 100.0).round() / 100.0,
@@ -581,10 +585,16 @@ async fn main() {
         sem: tokio::sync::Semaphore::new(cfg.fetch_concurrency),
         rate: Mutex::new(VecDeque::new()),
         ddg_warm: Mutex::new(None),
+        ddg_down_until: Mutex::new(None),
         started: Instant::now(),
         http,
         cfg,
     });
+
+    // Warm the DuckDuckGo cookie session in the background so the first
+    // search does not hit the anti-bot interstitial.
+    let warm_state = state.clone();
+    tokio::spawn(async move { search::warmup(&warm_state).await });
 
     let protected = Router::new()
         .route("/search", get(search_get).post(search_post))

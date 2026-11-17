@@ -134,6 +134,32 @@ fn host_of(url: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Query words used to drop obviously unrelated results (search engines serve
+/// generic filler pages when they rate-limit a client).
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 3)
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn filter_relevant(items: Vec<Value>, tokens: &[String]) -> Vec<Value> {
+    if tokens.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|item| {
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let snippet = item.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+            let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let haystack = format!("{title} {snippet} {url}").to_lowercase();
+            tokens.iter().any(|token| haystack.contains(token.as_str()))
+        })
+        .collect()
+}
+
 fn dedupe(items: Vec<Value>, limit: usize) -> Vec<Value> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<Value> = Vec::new();
@@ -211,65 +237,54 @@ fn ddg_unwrap(href: &str) -> Option<String> {
 
 /// DuckDuckGo HTML endpoint. Needs a cookie handshake first (a GET of the home
 /// page), otherwise it answers 202 with an anti-bot page.
-async fn duckduckgo(
+async fn ensure_warm(st: &Arc<AppState>, force: bool) {
+    let needs = {
+        let warm = st.ddg_warm.lock().unwrap();
+        force || warm.map(|t| t.elapsed() > DDG_WARM_TTL).unwrap_or(true)
+    };
+    if !needs {
+        return;
+    }
+    if let Ok(resp) = st.http.get("https://duckduckgo.com/").send().await {
+        let _ = resp.bytes().await;
+    }
+    *st.ddg_warm.lock().unwrap() = Some(Instant::now());
+}
+
+/// Warms the DuckDuckGo cookie session (called once at startup).
+pub async fn warmup(st: &Arc<AppState>) {
+    ensure_warm(st, true).await;
+}
+
+async fn ddg_post(
     st: &Arc<AppState>,
     query: &str,
-    lang: Option<&str>,
-) -> Result<Vec<Value>, ApiError> {
-    let needs_warm = {
-        let warm = st.ddg_warm.lock().unwrap();
-        warm.map(|t| t.elapsed() > DDG_WARM_TTL).unwrap_or(true)
-    };
-    if needs_warm {
-        if let Ok(resp) = st.http.get("https://duckduckgo.com/").send().await {
-            let _ = resp.bytes().await;
-        }
-        *st.ddg_warm.lock().unwrap() = Some(Instant::now());
-    }
-
-    let cyrillic = query
-        .chars()
-        .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c));
-    let region = match lang.map(|l| l.to_ascii_lowercase()) {
-        Some(l) if l.starts_with("ru") => "ru-ru".to_string(),
-        Some(l) if l.starts_with("en") => "us-en".to_string(),
-        _ => {
-            if cyrillic {
-                "ru-ru".to_string()
-            } else {
-                "wt-wt".to_string()
-            }
-        }
-    };
-
+    region: &str,
+) -> Result<(reqwest::StatusCode, String), ApiError> {
     let resp = st
         .http
         .post("https://html.duckduckgo.com/html/")
         .header(reqwest::header::REFERER, "https://duckduckgo.com/")
-        .form(&[("q", query), ("kl", region.as_str())])
+        .form(&[("q", query), ("kl", region)])
         .send()
         .await
-        .map_err(|e| ApiError::upstream(format!("duckduckgo: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(ApiError::upstream(format!(
-            "duckduckgo HTTP {}",
-            resp.status().as_u16()
-        )));
-    }
+        .map_err(|e| ApiError::upstream(format!("request failed: {e}")))?;
+    let status = resp.status();
     let body = resp
         .text()
         .await
-        .map_err(|e| ApiError::upstream(format!("duckduckgo read: {e}")))?;
-    if body.contains("anomaly-modal") || body.contains("If this error persists") {
-        return Err(ApiError::upstream("duckduckgo: anti-bot page"));
-    }
+        .map_err(|e| ApiError::upstream(format!("read failed: {e}")))?;
+    Ok((status, body))
+}
 
-    let doc = scraper::Html::parse_document(&body);
-    let anchor_sel =
-        scraper::Selector::parse("a.result__a").expect("static selector");
-    let snippet_sel =
-        scraper::Selector::parse(".result__snippet").expect("static selector");
+fn ddg_blocked(body: &str) -> bool {
+    body.contains("anomaly-modal") || body.contains("If this error persists")
+}
+
+fn parse_ddg(body: &str) -> Vec<Value> {
+    let doc = scraper::Html::parse_document(body);
+    let anchor_sel = scraper::Selector::parse("a.result__a").expect("static selector");
+    let snippet_sel = scraper::Selector::parse(".result__snippet").expect("static selector");
     let snippets: Vec<String> = doc
         .select(&snippet_sel)
         .map(|node| collapse(&strip_tags(&node.text().collect::<Vec<_>>().join(" "))))
@@ -293,8 +308,56 @@ async fn duckduckgo(
             "engine": "duckduckgo",
         }));
     }
-    Ok(items)
+    items
 }
+
+async fn duckduckgo(
+    st: &Arc<AppState>,
+    query: &str,
+    lang: Option<&str>,
+) -> Result<Vec<Value>, ApiError> {
+    let cyrillic = query
+        .chars()
+        .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c));
+    let region = match lang.map(|l| l.to_ascii_lowercase()) {
+        Some(l) if l.starts_with("ru") => "ru-ru".to_string(),
+        Some(l) if l.starts_with("en") => "us-en".to_string(),
+        _ => {
+            if cyrillic {
+                "ru-ru".to_string()
+            } else {
+                "wt-wt".to_string()
+            }
+        }
+    };
+
+    ensure_warm(st, false).await;
+
+    let mut last = String::from("no attempt");
+    for attempt in 0..2 {
+        if attempt == 1 {
+            // The anti-bot page usually means the cookie session went stale.
+            ensure_warm(st, true).await;
+        }
+        let (status, body) = ddg_post(st, query, &region).await?;
+        if !status.is_success() {
+            last = format!("HTTP {}", status.as_u16());
+            continue;
+        }
+        if ddg_blocked(&body) {
+            last = "anti-bot page".to_string();
+            continue;
+        }
+        let items = parse_ddg(&body);
+        if !items.is_empty() {
+            return Ok(items);
+        }
+        last = "no results".to_string();
+        break;
+    }
+    Err(ApiError::upstream(last))
+}
+
 fn child_text(node: &roxmltree::Node<'_, '_>, tag: &str) -> String {
     node.children()
         .find(|c| c.has_tag_name(tag))
@@ -537,6 +600,22 @@ async fn wikipedia(
 }
 
 
+/// True while DuckDuckGo is in the post-anti-bot cooldown window.
+pub fn ddg_cooling_down(st: &Arc<AppState>) -> bool {
+    let guard = st.ddg_down_until.lock().unwrap();
+    guard.map(|t| t > Instant::now()).unwrap_or(false)
+}
+
+fn set_ddg_cooldown(st: &Arc<AppState>) {
+    let until = Instant::now() + st.cfg.ddg_cooldown;
+    *st.ddg_down_until.lock().unwrap() = Some(until);
+}
+
+fn ddg_is_block_error(err: &ApiError) -> bool {
+    let msg = err.msg.to_ascii_lowercase();
+    msg.contains("anti-bot") || msg.contains("http 202") || msg.contains("http 429")
+}
+
 pub async fn search(
     st: &Arc<AppState>,
     query: &str,
@@ -577,11 +656,19 @@ pub async fn search(
         }
     }
 
-    // Bing HTML first (real result links after decoding click-tracking wrappers),
-    // then Bing RSS, then Wikipedia as an encyclopedic fallback.
+    // DuckDuckGo first (best relevance when the session is healthy), then Bing
+    // HTML (real links after decoding click-tracking wrappers), Bing RSS, and
+    // Wikipedia as an encyclopedic fallback. Backends are merged until enough
+    // relevant results are collected; unrelated filler (what throttled engines
+    // serve) is dropped before merging.
+    let tokens = query_tokens(query);
     for attempt in ["duckduckgo", "bing-html", "bing-rss", "wikipedia"] {
-        if !collected.is_empty() {
+        if collected.len() >= count {
             break;
+        }
+        if attempt == "duckduckgo" && ddg_cooling_down(st) {
+            errors.push("duckduckgo: cooling down after anti-bot response".to_string());
+            continue;
         }
         let outcome = match attempt {
             "duckduckgo" => duckduckgo(st, query, lang).await,
@@ -590,12 +677,25 @@ pub async fn search(
             _ => wikipedia(st, query, count, lang).await,
         };
         match outcome {
-            Ok(mut items) if !items.is_empty() => {
+            Ok(items) if !items.is_empty() => {
+                let total = items.len();
+                let mut relevant = filter_relevant(items, &tokens);
+                if relevant.is_empty() {
+                    errors.push(format!(
+                        "{attempt}: {total} results dropped as irrelevant"
+                    ));
+                    continue;
+                }
                 engines.push(attempt.to_string());
-                collected.append(&mut items);
+                collected.append(&mut relevant);
             }
             Ok(_) => errors.push(format!("{attempt}: no results")),
-            Err(e) => errors.push(format!("{attempt}: {}", e.msg)),
+            Err(e) => {
+                if attempt == "duckduckgo" && ddg_is_block_error(&e) {
+                    set_ddg_cooldown(st);
+                }
+                errors.push(format!("{attempt}: {}", e.msg));
+            }
         }
     }
 
@@ -622,7 +722,27 @@ pub async fn search(
 
 #[cfg(test)]
 mod tests {
-    use super::{base64url_decode, ddg_unwrap, decode_bing_href};
+    use super::{
+        base64url_decode, ddg_unwrap, decode_bing_href, filter_relevant, query_tokens,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn relevance_filter_drops_unrelated_filler() {
+        let tokens = query_tokens("pearl miner config");
+        assert!(tokens.contains(&"pearl".to_string()));
+        let items = vec![
+            json!({"title": "Pearl config guide", "url": "https://example.com/a", "snippet": ""}),
+            json!({"title": "Просто Моти", "url": "https://ru.hitmoz.org/x", "snippet": "песни"}),
+        ];
+        let kept = filter_relevant(items, &tokens);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/a")
+        );
+        assert_eq!(filter_relevant(vec![json!({"title": "x"})], &[]).len(), 1);
+    }
 
     #[test]
     fn unwraps_duckduckgo_redirect() {
