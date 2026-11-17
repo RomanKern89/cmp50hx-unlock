@@ -1,4 +1,5 @@
-//! Metasearch: Bing RSS (structured) -> Bing HTML fallback -> optional SearXNG.
+//! Metasearch cascade: DuckDuckGo HTML -> Bing HTML -> Mwmbl -> Bing RSS ->
+//! Wikipedia -> optional SearXNG, merged by query-word relevance.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -559,6 +560,70 @@ async fn searx(
     Ok(items)
 }
 
+/// Flattens Mwmbl's `[{value, is_bold}]` fragments into a plain string.
+fn join_parts(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part.get("value").and_then(|v| v.as_str()) {
+                    out.push_str(text);
+                }
+            }
+            collapse(&strip_tags(&out))
+        }
+        Some(Value::String(text)) => collapse(&strip_tags(text)),
+        _ => String::new(),
+    }
+}
+
+/// Mwmbl: small open-source community index with a keyless JSON API. Weak
+/// coverage for niche topics, but independent from Bing/DDG and never captcha'd.
+async fn mwmbl(st: &Arc<AppState>, query: &str) -> Result<Vec<Value>, ApiError> {
+    let mut url = Url::parse("https://api.mwmbl.org/api/v1/search/")
+        .map_err(|e| ApiError::bad(format!("bad mwmbl url: {e}")))?;
+    url.query_pairs_mut().append_pair("s", query);
+
+    let resp = st
+        .http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ApiError::upstream(format!("mwmbl: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ApiError::upstream(format!(
+            "mwmbl HTTP {}",
+            resp.status().as_u16()
+        )));
+    }
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::upstream(format!("mwmbl json: {e}")))?;
+    let hits = data
+        .as_array()
+        .ok_or_else(|| ApiError::upstream("mwmbl: unexpected payload"))?;
+
+    let mut items = Vec::new();
+    for hit in hits {
+        let link = hit.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if link.is_empty() {
+            continue;
+        }
+        let title = join_parts(hit.get("title"));
+        if title.is_empty() {
+            continue;
+        }
+        items.push(json!({
+            "title": title,
+            "url": link,
+            "snippet": join_parts(hit.get("extract")),
+            "engine": "mwmbl",
+        }));
+    }
+    Ok(items)
+}
+
 /// Encyclopedic fallback: Wikipedia search API (no key, no captcha, stable).
 async fn wikipedia(
     st: &Arc<AppState>,
@@ -696,7 +761,7 @@ pub async fn search(
     // relevant results are collected; unrelated filler (what throttled engines
     // serve) is dropped before merging.
     let tokens = query_tokens(query);
-    for attempt in ["duckduckgo", "bing-html", "bing-rss", "wikipedia"] {
+    for attempt in ["duckduckgo", "bing-html", "mwmbl", "bing-rss", "wikipedia"] {
         if collected.len() >= count {
             break;
         }
@@ -707,6 +772,7 @@ pub async fn search(
         let outcome = match attempt {
             "duckduckgo" => duckduckgo(st, query, lang).await,
             "bing-html" => bing_html(st, query, count, lang).await,
+            "mwmbl" => mwmbl(st, query).await,
             "bing-rss" => bing_rss(st, query, count, lang).await,
             _ => wikipedia(st, query, count, lang).await,
         };
