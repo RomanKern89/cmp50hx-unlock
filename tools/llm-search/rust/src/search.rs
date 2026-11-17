@@ -145,9 +145,16 @@ fn query_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Relevance score used only for ordering: title hits weigh more than URL or
-/// snippet hits, and the score counts distinct query words.
-fn relevance_score(item: &Value, tokens: &[String]) -> usize {
+/// How well a result matches the query: `covered` = number of distinct query
+/// words found anywhere in the item, `weight` = title hits weigh more than URL
+/// or snippet hits (used only for ordering).
+#[derive(Debug, PartialEq)]
+struct Relevance {
+    covered: usize,
+    weight: usize,
+}
+
+fn relevance(item: &Value, tokens: &[String]) -> Relevance {
     let title = item
         .get("title")
         .and_then(|v| v.as_str())
@@ -163,20 +170,34 @@ fn relevance_score(item: &Value, tokens: &[String]) -> usize {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase();
-    tokens
-        .iter()
-        .map(|token| {
-            if title.contains(token.as_str()) {
-                3
-            } else if url.contains(token.as_str()) {
-                2
-            } else if snippet.contains(token.as_str()) {
-                1
-            } else {
-                0
-            }
-        })
-        .sum()
+    let mut relevance = Relevance {
+        covered: 0,
+        weight: 0,
+    };
+    for token in tokens {
+        let hit = if title.contains(token.as_str()) {
+            3
+        } else if url.contains(token.as_str()) {
+            2
+        } else if snippet.contains(token.as_str()) {
+            1
+        } else {
+            continue;
+        };
+        relevance.covered += 1;
+        relevance.weight += hit;
+    }
+    relevance
+}
+
+/// A result is "strong" when it covers at least half of the query words; weak
+/// matches (engines answer with brand homepages when they throttle) do not
+/// satisfy `count` on their own.
+fn is_strong(rel: &Relevance, tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    rel.covered * 2 >= tokens.len()
 }
 
 fn filter_relevant(items: Vec<Value>, tokens: &[String]) -> Vec<Value> {
@@ -756,13 +777,18 @@ pub async fn search(
     }
 
     // DuckDuckGo first (best relevance when the session is healthy), then Bing
-    // HTML (real links after decoding click-tracking wrappers), Bing RSS, and
-    // Wikipedia as an encyclopedic fallback. Backends are merged until enough
-    // relevant results are collected; unrelated filler (what throttled engines
-    // serve) is dropped before merging.
+    // HTML (real links after decoding click-tracking wrappers), Mwmbl, Bing RSS
+    // and Wikipedia as an encyclopedic fallback. Engines are merged until enough
+    // *strong* matches are collected: throttled engines answer with brand
+    // homepages that match a single query word, and those must not satisfy
+    // `count` on their own. Unrelated filler is dropped before merging.
     let tokens = query_tokens(query);
     for attempt in ["duckduckgo", "bing-html", "mwmbl", "bing-rss", "wikipedia"] {
-        if collected.len() >= count {
+        let strong = collected
+            .iter()
+            .filter(|item| is_strong(&relevance(item, &tokens), &tokens))
+            .count();
+        if strong >= count {
             break;
         }
         if attempt == "duckduckgo" && ddg_cooling_down(st) {
@@ -799,9 +825,15 @@ pub async fn search(
         }
     }
 
-    // Order by relevance across engines (stable: engine priority wins ties),
-    // then deduplicate and trim to the requested count.
-    collected.sort_by_key(|item| std::cmp::Reverse(relevance_score(item, &tokens)));
+    // Rank by query-word coverage and, on ties, by where the words matched
+    // (stable sort keeps engine priority when scores are equal).
+    collected.sort_by(|a, b| {
+        let ra = relevance(a, &tokens);
+        let rb = relevance(b, &tokens);
+        rb.covered
+            .cmp(&ra.covered)
+            .then(rb.weight.cmp(&ra.weight))
+    });
 
     let results = dedupe(collected, count);
     let found = results.len();
@@ -827,8 +859,8 @@ pub async fn search(
 #[cfg(test)]
 mod tests {
     use super::{
-        base64url_decode, ddg_unwrap, decode_bing_href, filter_relevant, query_tokens,
-        relevance_score,
+        base64url_decode, ddg_unwrap, decode_bing_href, filter_relevant, is_strong,
+        query_tokens, relevance,
     };
     use serde_json::json;
 
@@ -850,21 +882,32 @@ mod tests {
     }
 
     #[test]
-    fn relevance_score_prefers_title_hits() {
+    fn relevance_prefers_title_hits_and_strong_coverage() {
         let tokens = query_tokens("pearl mining pool");
         let title_hit = json!({
             "title": "Pearl mining pool list",
             "url": "https://example.com/a",
             "snippet": ""
         });
-        let url_hit = json!({
-            "title": "Pools",
-            "url": "https://mining.example.com/pearl",
+        let weak_hit = json!({
+            "title": "Pearl",
+            "url": "https://example.com/pearl",
             "snippet": "pearl"
         });
-        assert!(relevance_score(&title_hit, &tokens) > relevance_score(&url_hit, &tokens));
-        let mut items = vec![url_hit, title_hit];
-        items.sort_by_key(|item| std::cmp::Reverse(relevance_score(item, &tokens)));
+        let rel_title = relevance(&title_hit, &tokens);
+        let rel_weak = relevance(&weak_hit, &tokens);
+        assert_eq!(rel_title.covered, 3);
+        assert_eq!(rel_weak.covered, 1);
+        assert!(rel_title.weight > rel_weak.weight);
+        assert!(is_strong(&rel_title, &tokens));
+        assert!(!is_strong(&rel_weak, &tokens));
+
+        let mut items = vec![weak_hit, title_hit];
+        items.sort_by(|a, b| {
+            let ra = relevance(a, &tokens);
+            let rb = relevance(b, &tokens);
+            rb.covered.cmp(&ra.covered).then(rb.weight.cmp(&ra.weight))
+        });
         assert_eq!(
             items[0].get("title").and_then(|v| v.as_str()),
             Some("Pearl mining pool list")
