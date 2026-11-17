@@ -144,6 +144,40 @@ fn query_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Relevance score used only for ordering: title hits weigh more than URL or
+/// snippet hits, and the score counts distinct query words.
+fn relevance_score(item: &Value, tokens: &[String]) -> usize {
+    let title = item
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let snippet = item
+        .get("snippet")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let url = item
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    tokens
+        .iter()
+        .map(|token| {
+            if title.contains(token.as_str()) {
+                3
+            } else if url.contains(token.as_str()) {
+                2
+            } else if snippet.contains(token.as_str()) {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 fn filter_relevant(items: Vec<Value>, tokens: &[String]) -> Vec<Value> {
     if tokens.is_empty() {
         return items;
@@ -699,6 +733,10 @@ pub async fn search(
         }
     }
 
+    // Order by relevance across engines (stable: engine priority wins ties),
+    // then deduplicate and trim to the requested count.
+    collected.sort_by_key(|item| std::cmp::Reverse(relevance_score(item, &tokens)));
+
     let results = dedupe(collected, count);
     let found = results.len();
     let payload = json!({
@@ -724,6 +762,7 @@ pub async fn search(
 mod tests {
     use super::{
         base64url_decode, ddg_unwrap, decode_bing_href, filter_relevant, query_tokens,
+        relevance_score,
     };
     use serde_json::json;
 
@@ -742,6 +781,28 @@ mod tests {
             Some("https://example.com/a")
         );
         assert_eq!(filter_relevant(vec![json!({"title": "x"})], &[]).len(), 1);
+    }
+
+    #[test]
+    fn relevance_score_prefers_title_hits() {
+        let tokens = query_tokens("pearl mining pool");
+        let title_hit = json!({
+            "title": "Pearl mining pool list",
+            "url": "https://example.com/a",
+            "snippet": ""
+        });
+        let url_hit = json!({
+            "title": "Pools",
+            "url": "https://mining.example.com/pearl",
+            "snippet": "pearl"
+        });
+        assert!(relevance_score(&title_hit, &tokens) > relevance_score(&url_hit, &tokens));
+        let mut items = vec![url_hit, title_hit];
+        items.sort_by_key(|item| std::cmp::Reverse(relevance_score(item, &tokens)));
+        assert_eq!(
+            items[0].get("title").and_then(|v| v.as_str()),
+            Some("Pearl mining pool list")
+        );
     }
 
     #[test]
