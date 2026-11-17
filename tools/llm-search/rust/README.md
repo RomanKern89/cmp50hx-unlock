@@ -61,9 +61,11 @@ curl -s 'http://127.0.0.1:8099/research?q=rtx+3090+pearlhash+settings&count=3'
 ## Поисковые бэкенды и почему так
 
 С lmserver (один IP, без API-ключей) большинство движков закрыты антиботом:
-DuckDuckGo по обычному GET отдаёт `202`, Yandex — капчу, Mojeek — капчу,
-Brave — `429`, Ecosia — `403`, Marginalia недоступна, Google — согласие/пустую
-страницу.
+DuckDuckGo по обычному GET отдаёт `202` (и троттлит IP пачками), Yandex — капчу,
+Mojeek — капчу, Brave — `429`, Ecosia — `403`, Google — согласие/пустую страницу,
+Stract — `404`, Yep/Qwant API — `403`, публичные SearXNG (searx.be, priv.au,
+baresearch, searxng.site, search.inetol) — JS-проверку/`429`, Marginalia —
+«Wait A Moment» JS-челлендж.
 
 Что работает:
 
